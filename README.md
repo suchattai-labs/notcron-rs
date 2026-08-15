@@ -14,6 +14,8 @@ notcron                                    # the builder (primary interface)
 notcron list [--all] [--system]            # units notcron manages
 notcron add "0 3 * * *" /usr/bin/backup    # headless, from a cron expression
 notcron remove backup                      # stop, disable, delete, reload
+notcron trash                              # removals still undoable
+notcron restore 20260815T1110              # put one back, state and all
 ```
 
 `--user` and `--system` are global: they may be given before or after the
@@ -194,6 +196,9 @@ that would be replaced are listed and you are asked; refusing moves nothing.
 A unit that was enabled or running when it was removed is offered its old
 state back, as a separate question. `x` inside the trash discards an entry for
 good, with its own confirmation.
+
+The same undo without a terminal is `notcron trash` and `notcron restore`;
+see [the CLI](#undo-without-the-tui).
 
 ### Lingering
 
@@ -444,13 +449,16 @@ dependency.
 
 ## The CLI
 
-Three verbs. The TUI is the primary interface; these exist so notcron can be
+Six verbs. The TUI is the primary interface; these exist so notcron can be
 driven from a provisioning script.
 
 ```
-notcron list   [--user|--system] [--all]
-notcron remove [--user|--system] <name>
-notcron add    [--user|--system] [options] "<cron>" <command> [args...]
+notcron list    [--user|--system] [--all]
+notcron remove  [--user|--system] <name>
+notcron add     [--user|--system] [options] "<cron>" <command> [args...]
+notcron export  [--user|--system] [--dir <dir>] [--force] <name>
+notcron trash   [--user|--system] [list]
+notcron restore [--user|--system] [--no-enable] [--force] <trash-id>
 ```
 
 `add` options:
@@ -486,6 +494,49 @@ notcron remove backup       # accepts 'backup' or 'notcron-backup'
 ```
 
 `remove` refuses any unit notcron did not create.
+
+### Undo, without the TUI
+
+`remove` stashes rather than deletes, and prints the trash id it stashed
+into. That id is exactly what `restore` takes.
+
+```sh
+$ notcron remove backup
+removed notcron-backup.timer, notcron-backup.service
+kept in the trash as 20260815T111006Z-notcron-backup.timer
+undo with: notcron restore 20260815T111006Z-notcron-backup.timer
+
+$ notcron trash
+ID                                         UNIT                       SCOPE   AGE FILES STATE
+20260815T111006Z-notcron-backup.timer      notcron-backup.timer       user     46s    2 enabled,active
+
+$ notcron restore 20260815T1110
+restored /home/claude/.config/systemd/user/notcron-backup.timer
+restored /home/claude/.config/systemd/user/notcron-backup.service
+notcron-backup.timer is enabled and running again
+```
+
+`notcron trash` and `notcron trash list` are the same command. The id is the
+first column and every column is one whitespace-free token, so
+`notcron trash | awk 'NR>1 {print $1}'` is a list of ids. `STATE` is what the
+unit was when it was removed — `enabled`, `active`, `enabled,active` or `-`.
+
+**Restoring puts the state back too.** A unit that was enabled and running is
+enabled and running again, because a scripted undo that leaves the timer inert
+is a job that silently stops firing. `--no-enable` restores the files only.
+
+**Restoring never clobbers.** If a unit of that name exists again the restore
+is refused, names every path it would have replaced, and moves nothing;
+`--force` is the way through, exactly as with `export --force`.
+
+Ids are long, so any unambiguous prefix works — usually the timestamp alone.
+An ambiguous prefix is an error listing the candidates rather than a guess.
+
+Trash is per scope: a system-scope removal is listed and restored with
+`--system`, and lives in `/var/lib/notcron/trash` instead of
+`$XDG_DATA_HOME/notcron/trash`. Entries expire on their own (the last 50
+removals, nothing older than 30 days); the TUI's `U` view is where a single
+entry is thrown away early.
 
 ## Scope
 

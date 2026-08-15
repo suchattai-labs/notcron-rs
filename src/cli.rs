@@ -1,11 +1,14 @@
-//! The headless command line. Four verbs only -- `list`, `remove`, `add` and
-//! `export` -- because the TUI is the primary interface; these exist so
-//! notcron can be driven from a provisioning script.
+//! The headless command line. Six verbs only -- `list`, `remove`, `add`,
+//! `export`, `trash` and `restore` -- because the TUI is the primary
+//! interface; these exist so notcron can be driven from a provisioning
+//! script. `trash` and `restore` are the scriptable half of the TUI's undo:
+//! whatever `remove` stashed can be listed and put back without a terminal.
 
 use crate::cron::{self, Translation};
 use crate::export as exporter;
 use crate::linger;
 use crate::systemd;
+use crate::trash::{RestoreError, Trash, TrashEntry};
 use crate::unit::escape;
 use crate::unit::model::{Body, Schedule, Scope, Unit};
 use clap::{Args, Parser, Subcommand};
@@ -42,6 +45,10 @@ pub enum Command {
     Add(AddArgs),
     /// print a unit's files, or write them to a directory
     Export(ExportArgs),
+    /// list the removals still held in the trash
+    Trash(TrashArgs),
+    /// put a removed unit back, files and state
+    Restore(RestoreArgs),
 }
 
 /// `--user` (the default) or `--system`.
@@ -104,6 +111,39 @@ pub struct ExportArgs {
     name: String,
 }
 
+/// `notcron trash` and `notcron trash list` are the same command.
+///
+/// Listing is the only thing the CLI does to the trash as a whole -- entries
+/// expire on their own, and the TUI is where you go to throw one away early
+/// -- so the bare verb does the obvious thing. The explicit `list` exists so
+/// a script reads unambiguously and so a later `trash prune` has somewhere to
+/// live without changing what `notcron trash` means today.
+#[derive(Args)]
+pub struct TrashArgs {
+    #[command(subcommand)]
+    what: Option<TrashCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum TrashCommand {
+    /// list the removals still held in the trash (the default)
+    List,
+}
+
+#[derive(Args)]
+pub struct RestoreArgs {
+    /// put the files back but leave the unit neither enabled nor started
+    #[arg(long)]
+    no_enable: bool,
+
+    /// overwrite unit files that exist again under the original names
+    #[arg(long)]
+    force: bool,
+
+    /// trash id from `notcron trash`, or an unambiguous prefix of one
+    id: String,
+}
+
 #[derive(Args)]
 pub struct AddArgs {
     /// unit name (default: derived from the command)
@@ -164,6 +204,8 @@ pub fn run(cmd: Command, scope: Scope) -> ExitCode {
         Command::Remove(a) => remove(a, scope),
         Command::Add(a) => add(a, scope),
         Command::Export(a) => export(a, scope),
+        Command::Trash(a) => trash_list(a, scope),
+        Command::Restore(a) => restore(a, scope),
     }
 }
 
@@ -240,11 +282,208 @@ fn remove(a: RemoveArgs, scope: Scope) -> ExitCode {
             // The files are not gone, only stashed; say where, and how to
             // change your mind.
             if let Some(t) = &r.trashed {
-                println!("kept in the trash as {} (undo from the TUI)", t.id);
+                // The id printed here is the exact token `restore` takes.
+                println!("kept in the trash as {}", t.id);
+                println!("undo with: notcron restore {}{}", t.id, scope_suffix(scope));
             }
             ExitCode::SUCCESS
         }
         Err(e) => fail(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// trash / restore
+// ---------------------------------------------------------------------------
+
+/// What to append to a suggested command line so it stays in this scope.
+/// User scope is the default, so it needs nothing.
+pub(crate) fn scope_suffix(scope: Scope) -> &'static str {
+    match scope {
+        Scope::System => " --system",
+        Scope::User => "",
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// An age as a single whitespace-free token, so `awk`-style column splitting
+/// keeps working. The TUI's "3m ago" is friendlier to read and worse to parse.
+pub(crate) fn age_token(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// The state a unit was in when it was removed, as one token: `enabled`,
+/// `active`, `enabled,active` or `-`. Never empty, so the column is always
+/// present for a script splitting on whitespace.
+pub(crate) fn state_token(enabled: bool, active: bool) -> String {
+    match (enabled, active) {
+        (true, true) => "enabled,active".into(),
+        (true, false) => "enabled".into(),
+        (false, true) => "active".into(),
+        (false, false) => "-".into(),
+    }
+}
+
+pub(crate) fn trash_header() -> String {
+    format!(
+        "{:<42} {:<26} {:<6} {:>4} {:>5} STATE",
+        "ID", "UNIT", "SCOPE", "AGE", "FILES"
+    )
+}
+
+/// One listing row. The id comes first and is never truncated: it is the
+/// token `notcron restore` takes, so `notcron trash | awk '{print $1}'` has
+/// to yield something usable.
+pub(crate) fn trash_row(e: &TrashEntry, now: u64) -> String {
+    format!(
+        "{:<42} {:<26} {:<6} {:>4} {:>5} {}",
+        e.id,
+        e.unit,
+        e.scope.as_str(),
+        age_token(e.age_secs(now)),
+        e.files.len(),
+        state_token(e.was_enabled, e.was_active)
+    )
+}
+
+/// Turn what the user typed into exactly one trash id.
+///
+/// An exact id always wins. Otherwise the token is treated as a prefix --
+/// ids are timestamped and long, and the timestamp alone usually picks out
+/// one removal. An ambiguous prefix is an error listing the candidates:
+/// guessing which of two removals to undo is not a decision notcron may make
+/// on the user's behalf.
+pub(crate) fn resolve_trash_id(entries: &[TrashEntry], token: &str) -> Result<String, String> {
+    if token.is_empty() {
+        return Err("no trash id given (try: notcron trash)".into());
+    }
+    if let Some(e) = entries.iter().find(|e| e.id == token) {
+        return Ok(e.id.clone());
+    }
+    let hits: Vec<&TrashEntry> = entries.iter().filter(|e| e.id.starts_with(token)).collect();
+    match hits.len() {
+        0 => Err(format!(
+            "no trash entry matching '{token}' (try: notcron trash)"
+        )),
+        1 => Ok(hits[0].id.clone()),
+        _ => {
+            let names: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            Err(format!(
+                "'{token}' matches {} entries; use a longer id:\n  {}",
+                hits.len(),
+                names.join("\n  ")
+            ))
+        }
+    }
+}
+
+fn trash_list(a: TrashArgs, scope: Scope) -> ExitCode {
+    // Only one thing to do so far; the match keeps a later verb honest.
+    match a.what {
+        None | Some(TrashCommand::List) => {}
+    }
+    let entries = match Trash::for_scope(scope).list() {
+        Ok(e) => e,
+        Err(e) => return fail(e),
+    };
+    if entries.is_empty() {
+        println!("the trash is empty ({} scope)", scope.as_str());
+        return ExitCode::SUCCESS;
+    }
+    let now = now_secs();
+    println!("{}", trash_header());
+    for e in &entries {
+        println!("{}", trash_row(e, now));
+    }
+    ExitCode::SUCCESS
+}
+
+/// `notcron restore <id>` -- the scriptable half of the TUI's undo.
+///
+/// Restoring puts the unit back the way it was, enabled and running included:
+/// a caller who scripted `remove` and then `restore` expects the timer to be
+/// firing again afterwards, and a unit that is on disk but inert is the
+/// failure mode that goes unnoticed until the job silently stops running.
+/// `--no-enable` is there for the case where the files are all that is
+/// wanted.
+fn restore(a: RestoreArgs, scope: Scope) -> ExitCode {
+    let trash = Trash::for_scope(scope);
+    let entries = match trash.list() {
+        Ok(e) => e,
+        Err(e) => return fail(e),
+    };
+    let id = match resolve_trash_id(&entries, &a.id) {
+        Ok(id) => id,
+        Err(e) => return fail(e),
+    };
+
+    let report = match trash.restore(&id, a.force) {
+        Ok(r) => r,
+        Err(RestoreError::Conflict(paths)) => {
+            let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            return fail(format!(
+                "{} already exist(s); nothing was moved. Re-run with --force to replace.",
+                names.join(", ")
+            ));
+        }
+        Err(e) => return fail(e),
+    };
+
+    for p in &report.restored {
+        println!("restored {}", p.display());
+    }
+    for p in &report.overwritten {
+        eprintln!("notcron: warning: replaced {}", p.display());
+    }
+    if let Err(e) = systemd::daemon_reload(scope) {
+        eprintln!("notcron: warning: daemon-reload: {}", e.trim());
+    }
+
+    let want = crate::ui::trashview::describe_state(report.was_enabled, report.was_active);
+    if !(report.was_enabled || report.was_active) {
+        return ExitCode::SUCCESS;
+    }
+    if a.no_enable {
+        println!(
+            "{} was {want} when removed; --no-enable left it alone",
+            report.unit
+        );
+        return ExitCode::SUCCESS;
+    }
+    // enable --now covers both halves in one call; a unit that was running
+    // but never enabled only wants a start.
+    let mut args: Vec<&str> = match (report.was_enabled, report.was_active) {
+        (true, true) => vec!["enable", "--now"],
+        (true, false) => vec!["enable"],
+        _ => vec!["start"],
+    };
+    args.push(&report.unit);
+    match systemd::systemctl(scope, &args) {
+        // The files are back either way, so a failure here is a warning, not
+        // a failed restore -- exactly as `add` treats a failed enable.
+        Ok(_) => {
+            println!("{} is {want} again", report.unit);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "notcron: warning: {} is restored but not {want}: {}",
+                report.unit,
+                e.trim()
+            );
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -514,6 +753,22 @@ mod tests {
                 vec!["notcron", "--system", "add", "@daily", "/bin/true"],
                 vec!["notcron", "add", "--system", "@daily", "/bin/true"],
             ),
+            (
+                vec!["notcron", "--system", "trash"],
+                vec!["notcron", "trash", "--system"],
+            ),
+            (
+                vec!["notcron", "--system", "trash", "list"],
+                vec!["notcron", "trash", "list", "--system"],
+            ),
+            (
+                vec!["notcron", "--system", "restore", "20260815T105403Z-x.timer"],
+                vec!["notcron", "restore", "20260815T105403Z-x.timer", "--system"],
+            ),
+            (
+                vec!["notcron", "--system", "restore", "--force", "abc"],
+                vec!["notcron", "restore", "abc", "--force", "--system"],
+            ),
         ] {
             assert_eq!(scope_of(&before), Scope::System, "{before:?}");
             assert_eq!(scope_of(&after), Scope::System, "{after:?}");
@@ -705,5 +960,271 @@ mod tests {
         for p in &forced.written {
             assert_ne!(std::fs::read_to_string(p).unwrap(), "PRE-EXISTING\n");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // trash / restore
+    // -----------------------------------------------------------------
+
+    fn restore_args(argv: &[&str]) -> RestoreArgs {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Command::Restore(a)) => a,
+            _ => panic!("expected restore in {argv:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_takes_an_id_and_defaults_to_putting_the_state_back() {
+        let a = restore_args(&["notcron", "restore", "20260815T105403Z-notcron-foo.timer"]);
+        assert_eq!(a.id, "20260815T105403Z-notcron-foo.timer");
+        assert!(!a.force, "clobbering must be opt-in");
+        assert!(
+            !a.no_enable,
+            "restoring the enabled/active state is the default"
+        );
+    }
+
+    #[test]
+    fn restore_accepts_its_two_flags_in_any_order() {
+        for argv in [
+            vec!["notcron", "restore", "--force", "--no-enable", "abc"],
+            vec!["notcron", "restore", "abc", "--no-enable", "--force"],
+        ] {
+            let a = restore_args(&argv);
+            assert_eq!(a.id, "abc", "{argv:?}");
+            assert!(a.force && a.no_enable, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn restore_needs_an_id() {
+        assert!(Cli::try_parse_from(["notcron", "restore"]).is_err());
+    }
+
+    /// `notcron trash` and `notcron trash list` are the same command, and
+    /// nothing else is a trash subcommand.
+    #[test]
+    fn the_bare_trash_verb_means_list() {
+        for argv in [
+            vec!["notcron", "trash"],
+            vec!["notcron", "trash", "list"],
+            vec!["notcron", "trash", "list", "--system"],
+        ] {
+            match Cli::try_parse_from(&argv).unwrap().command {
+                Some(Command::Trash(_)) => {}
+                _ => panic!("expected trash in {argv:?}"),
+            }
+        }
+        assert!(Cli::try_parse_from(["notcron", "trash", "empty"]).is_err());
+    }
+
+    // Ids as the trash really makes them: a compact UTC stamp, a dash, the
+    // unit name.
+    fn entry(id: &str, unit: &str) -> TrashEntry {
+        TrashEntry {
+            id: id.into(),
+            unit: unit.into(),
+            scope: Scope::User,
+            removed_at: 1_755_255_243,
+            was_enabled: true,
+            was_active: true,
+            files: vec![crate::trash::TrashedFile {
+                stored: unit.into(),
+                original: PathBuf::from("/tmp").join(unit),
+            }],
+        }
+    }
+
+    #[test]
+    fn an_exact_id_resolves_to_itself() {
+        let es = vec![
+            entry("20260815T105403Z-notcron-foo.timer", "notcron-foo.timer"),
+            entry("20260815T105501Z-notcron-bar.timer", "notcron-bar.timer"),
+        ];
+        assert_eq!(
+            resolve_trash_id(&es, "20260815T105403Z-notcron-foo.timer").unwrap(),
+            "20260815T105403Z-notcron-foo.timer"
+        );
+    }
+
+    #[test]
+    fn an_unambiguous_prefix_is_enough() {
+        let es = vec![
+            entry("20260815T105403Z-notcron-foo.timer", "notcron-foo.timer"),
+            entry("20260815T105501Z-notcron-bar.timer", "notcron-bar.timer"),
+        ];
+        assert_eq!(
+            resolve_trash_id(&es, "20260815T1054").unwrap(),
+            "20260815T105403Z-notcron-foo.timer"
+        );
+        // Down to the single character that still separates them.
+        assert_eq!(
+            resolve_trash_id(&es, "20260815T1055").unwrap(),
+            "20260815T105501Z-notcron-bar.timer"
+        );
+    }
+
+    /// Two removals in the same second differ only by a counter suffix, which
+    /// is exactly when a short prefix stops being safe. Guessing would undo
+    /// the wrong removal, so it is an error that names the candidates.
+    #[test]
+    fn an_ambiguous_prefix_is_refused_rather_than_guessed() {
+        let es = vec![
+            entry("20260815T105403Z-notcron-foo.timer", "notcron-foo.timer"),
+            entry("20260815T105403Z-notcron-foo.timer-1", "notcron-foo.timer"),
+        ];
+        let err = resolve_trash_id(&es, "20260815T1054").unwrap_err();
+        assert!(err.contains("matches 2 entries"), "{err}");
+        assert!(
+            err.contains("20260815T105403Z-notcron-foo.timer-1"),
+            "{err}"
+        );
+        // The shorter id is still reachable exactly, even though it is a
+        // prefix of the longer one.
+        assert_eq!(
+            resolve_trash_id(&es, "20260815T105403Z-notcron-foo.timer").unwrap(),
+            "20260815T105403Z-notcron-foo.timer"
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_empty_id_says_where_to_look() {
+        let es = vec![entry("20260815T105403Z-notcron-foo.timer", "x.timer")];
+        for token in ["", "nope", "20260816"] {
+            let err = resolve_trash_id(&es, token).unwrap_err();
+            assert!(err.contains("notcron trash"), "{token}: {err}");
+        }
+        assert!(resolve_trash_id(&[], "anything").is_err());
+    }
+
+    #[test]
+    fn the_listing_puts_the_id_first_and_splits_on_whitespace() {
+        let e = entry("20260815T105403Z-notcron-foo.timer", "notcron-foo.timer");
+        let row = trash_row(&e, e.removed_at + 90);
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cols[0], e.id, "the id must be the first column: {row}");
+        assert_eq!(cols[1], "notcron-foo.timer");
+        assert_eq!(cols[2], "user");
+        assert_eq!(cols[3], "1m");
+        assert_eq!(cols[4], "1");
+        assert_eq!(cols[5], "enabled,active");
+        assert_eq!(cols.len(), 6, "{row}");
+        // Same column count in the header, so a script can trust the shape.
+        assert_eq!(trash_header().split_whitespace().count(), 6);
+    }
+
+    #[test]
+    fn every_removed_state_prints_one_word() {
+        assert_eq!(state_token(true, true), "enabled,active");
+        assert_eq!(state_token(true, false), "enabled");
+        assert_eq!(state_token(false, true), "active");
+        assert_eq!(state_token(false, false), "-");
+        for (e, a) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert!(!state_token(e, a).contains(' '));
+        }
+    }
+
+    #[test]
+    fn ages_are_one_token_at_every_scale() {
+        assert_eq!(age_token(0), "0s");
+        assert_eq!(age_token(59), "59s");
+        assert_eq!(age_token(60), "1m");
+        assert_eq!(age_token(3599), "59m");
+        assert_eq!(age_token(3600), "1h");
+        assert_eq!(age_token(86_399), "23h");
+        assert_eq!(age_token(86_400), "1d");
+        assert_eq!(age_token(30 * 86_400), "30d");
+    }
+
+    #[test]
+    fn a_system_scope_hint_carries_the_flag_and_a_user_one_does_not() {
+        assert_eq!(scope_suffix(Scope::System), " --system");
+        assert_eq!(scope_suffix(Scope::User), "");
+    }
+
+    /// The whole point of the feature: the id `remove` prints is the token
+    /// `restore` takes. This walks the real path -- stash into a temporary
+    /// trash, list it, resolve the printed id -- because a mismatch anywhere
+    /// in that chain makes the verb useless.
+    #[test]
+    fn the_id_a_removal_prints_is_the_id_a_restore_accepts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let units = tmp.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        let timer = units.join("notcron-foo.timer");
+        let service = units.join("notcron-foo.service");
+        std::fs::write(&timer, "[Timer]\nOnCalendar=daily\n").unwrap();
+        std::fs::write(&service, "[Service]\nExecStart=/bin/true\n").unwrap();
+
+        let trash = Trash::at(tmp.path().join("trash"));
+        let entry = trash
+            .stash(&crate::trash::StashRequest {
+                scope: Scope::User,
+                unit: "notcron-foo.timer".into(),
+                files: vec![timer.clone(), service.clone()],
+                was_enabled: true,
+                was_active: true,
+            })
+            .unwrap();
+
+        // What `remove` prints.
+        let printed = entry.id.clone();
+        let listed = trash.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, printed);
+        assert!(trash_row(&listed[0], now_secs()).starts_with(&printed));
+
+        // What `restore` does with it, in full and by prefix.
+        assert_eq!(resolve_trash_id(&listed, &printed).unwrap(), printed);
+        assert_eq!(resolve_trash_id(&listed, &printed[..16]).unwrap(), printed);
+
+        let report = trash.restore(&printed, false).unwrap();
+        assert_eq!(report.restored, vec![timer.clone(), service.clone()]);
+        assert!(report.was_enabled && report.was_active);
+        assert_eq!(
+            std::fs::read_to_string(&timer).unwrap(),
+            "[Timer]\nOnCalendar=daily\n"
+        );
+        assert!(trash.list().unwrap().is_empty());
+    }
+
+    /// The CLI's promise on a conflict, mirroring `export --force`: the
+    /// refusal names every offending path and moves nothing, and only
+    /// `--force` goes through.
+    #[test]
+    fn restoring_over_a_unit_that_exists_again_moves_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let units = tmp.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        let timer = units.join("notcron-foo.timer");
+        std::fs::write(&timer, "ORIGINAL\n").unwrap();
+
+        let trash = Trash::at(tmp.path().join("trash"));
+        let entry = trash
+            .stash(&crate::trash::StashRequest {
+                scope: Scope::User,
+                unit: "notcron-foo.timer".into(),
+                files: vec![timer.clone()],
+                was_enabled: false,
+                was_active: true,
+            })
+            .unwrap();
+        assert!(!timer.exists(), "the stash moves the file out");
+
+        // The name is taken again by the time the undo is attempted.
+        std::fs::write(&timer, "REBUILT\n").unwrap();
+        match trash.restore(&entry.id, false) {
+            Err(RestoreError::Conflict(paths)) => assert_eq!(paths, vec![timer.clone()]),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&timer).unwrap(), "REBUILT\n");
+        assert!(
+            !trash.list().unwrap().is_empty(),
+            "a refused restore keeps the entry"
+        );
+
+        let report = trash.restore(&entry.id, true).unwrap();
+        assert_eq!(report.overwritten, vec![timer.clone()]);
+        assert_eq!(std::fs::read_to_string(&timer).unwrap(), "ORIGINAL\n");
     }
 }

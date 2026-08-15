@@ -11,7 +11,7 @@ use crate::unit::model::Scope;
 use ratatui::prelude::*;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
 /// How many journal lines the pane holds.
@@ -92,44 +92,6 @@ pub fn split(area: Rect, tail: bool) -> Panes {
 // Following
 // ---------------------------------------------------------------------------
 
-/// Only system-scope reads may need elevation, and only when not already root.
-//
-// This mirrors the private helper in `systemd`; the non-following tail goes
-// through `systemd::journal`, but a live follow needs to own its own child
-// process and so has to build the command itself.
-fn need_sudo(scope: Scope) -> bool {
-    scope == Scope::System
-        && !std::fs::metadata("/proc/self")
-            .map(|m| {
-                use std::os::unix::fs::MetadataExt;
-                m.uid() == 0
-            })
-            .unwrap_or(false)
-}
-
-/// Build the `journalctl` invocation for a scope. `follow` adds `-f`.
-///
-/// The user journal needs `--user`; the system journal is journalctl's
-/// default and has no flag of its own, so passing `--system` would be wrong
-/// for a user who is also allowed to read it.
-pub fn journal_command(scope: Scope, unit: &str, lines: usize, follow: bool) -> Command {
-    let mut cmd = if need_sudo(scope) {
-        let mut c = Command::new("sudo");
-        c.arg("-n").arg("journalctl");
-        c
-    } else {
-        Command::new("journalctl")
-    };
-    if scope == Scope::User {
-        cmd.arg("--user");
-    }
-    cmd.args(["--no-pager", "-n", &lines.to_string(), "-u", unit]);
-    if follow {
-        cmd.arg("-f");
-    }
-    cmd
-}
-
 /// A live `journalctl -f`, read on a background thread.
 pub struct Follower {
     child: Child,
@@ -140,7 +102,7 @@ impl Follower {
     /// Start following `unit`. The child's stderr is discarded: it would
     /// otherwise be written straight over the alternate screen.
     pub fn start(scope: Scope, unit: &str, keep: usize) -> Result<Follower, String> {
-        let mut cmd = journal_command(scope, unit, keep, true);
+        let mut cmd = crate::systemd::journal_command(scope, unit, keep, true);
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -323,6 +285,7 @@ fn clip(s: &str, w: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn rect(w: u16, h: u16) -> Rect {
         Rect {
@@ -418,45 +381,6 @@ mod tests {
         let off = split(rect(80, 30), false);
         assert!(off.tail.is_none());
         assert_eq!(off.list.height, on.list.height + PANE_HEIGHT);
-    }
-
-    // -----------------------------------------------------------------
-    // The command
-    // -----------------------------------------------------------------
-
-    fn args_of(cmd: &Command) -> Vec<String> {
-        cmd.get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
-    }
-
-    #[test]
-    fn the_user_journal_is_asked_for_explicitly() {
-        let cmd = journal_command(Scope::User, "x.service", 10, false);
-        let args = args_of(&cmd);
-        assert!(args.contains(&"--user".to_string()), "{args:?}");
-        assert!(!args.contains(&"-f".to_string()), "{args:?}");
-        assert!(args.contains(&"x.service".to_string()));
-        assert_eq!(cmd.get_program(), "journalctl");
-    }
-
-    /// journalctl has no `--system`: the system journal is its default, and
-    /// passing a flag that does not exist would fail outright.
-    #[test]
-    fn the_system_journal_takes_no_scope_flag() {
-        let cmd = journal_command(Scope::System, "x.service", 10, false);
-        let args = args_of(&cmd);
-        assert!(
-            !args.iter().any(|a| a == "--user" || a == "--system"),
-            "{args:?}"
-        );
-    }
-
-    #[test]
-    fn following_adds_the_follow_flag_and_keeps_the_line_count() {
-        let args = args_of(&journal_command(Scope::User, "x.timer", 10, true));
-        assert!(args.contains(&"-f".to_string()), "{args:?}");
-        assert!(args.contains(&"10".to_string()), "{args:?}");
     }
 
     // -----------------------------------------------------------------

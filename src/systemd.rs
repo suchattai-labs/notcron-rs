@@ -127,9 +127,16 @@ pub fn is_active(scope: Scope, unit: &str) -> bool {
     )
 }
 
-/// Recent journal entries for a unit.
-pub fn journal(scope: Scope, unit: &str, lines: usize) -> String {
-    let n = lines.to_string();
+/// Build the `journalctl` invocation for a scope. `follow` adds `-f`.
+///
+/// The one place the journal command line is written down. [`journal`] runs it
+/// to completion for a one-shot tail; the TUI's follow pane spawns it itself
+/// because it has to own the child, so both come through here rather than
+/// composing the arguments twice.
+///
+/// journalctl has no `--system` flag with the same meaning as systemctl's: the
+/// system journal is its default, so only the user flag is passed explicitly.
+pub fn journal_command(scope: Scope, unit: &str, lines: usize, follow: bool) -> Command {
     let mut cmd = if need_sudo(scope) {
         let mut c = Command::new("sudo");
         c.arg("-n").arg("journalctl");
@@ -137,12 +144,19 @@ pub fn journal(scope: Scope, unit: &str, lines: usize) -> String {
     } else {
         Command::new("journalctl")
     };
-    // journalctl has no --system flag with the same meaning; the default is
-    // the system journal, so only the user flag is passed explicitly.
     if scope == Scope::User {
         cmd.arg("--user");
     }
-    cmd.args(["--no-pager", "-n", &n, "-u", unit]);
+    cmd.args(["--no-pager", "-n", &lines.to_string(), "-u", unit]);
+    if follow {
+        cmd.arg("-f");
+    }
+    cmd
+}
+
+/// Recent journal entries for a unit.
+pub fn journal(scope: Scope, unit: &str, lines: usize) -> String {
+    let mut cmd = journal_command(scope, unit, lines, false);
     match run(&mut cmd) {
         Ok(o) => {
             let text = combined(&o);
@@ -749,6 +763,73 @@ fn fill_states(scope: Scope, entries: &mut [Entry]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // journal_command
+    //
+    // The composition is pinned argument for argument, because two call
+    // sites (the one-shot tail here and the TUI's follow pane) used to build
+    // it separately and must stay byte-identical now that they share it.
+    // -----------------------------------------------------------------
+
+    fn program_and_args(cmd: &Command) -> (String, Vec<String>) {
+        (
+            cmd.get_program().to_string_lossy().into_owned(),
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_user_journal_command_is_exactly_this() {
+        let (prog, args) = program_and_args(&journal_command(Scope::User, "x.service", 10, false));
+        assert_eq!(prog, "journalctl");
+        assert_eq!(
+            args,
+            ["--user", "--no-pager", "-n", "10", "-u", "x.service"]
+        );
+    }
+
+    #[test]
+    fn following_appends_only_the_follow_flag() {
+        let (prog, args) = program_and_args(&journal_command(Scope::User, "x.timer", 10, true));
+        assert_eq!(prog, "journalctl");
+        assert_eq!(
+            args,
+            ["--user", "--no-pager", "-n", "10", "-u", "x.timer", "-f"]
+        );
+    }
+
+    /// journalctl has no `--system`: the system journal is its default, and
+    /// passing a flag that does not exist would fail outright. Off root the
+    /// read is elevated the same way every other system-scope call is.
+    #[test]
+    fn the_system_journal_takes_no_scope_flag() {
+        for follow in [false, true] {
+            let (prog, args) =
+                program_and_args(&journal_command(Scope::System, "x.service", 20, follow));
+            let mut want: Vec<&str> = if is_root() {
+                assert_eq!(prog, "journalctl");
+                Vec::new()
+            } else {
+                assert_eq!(prog, "sudo");
+                vec!["-n", "journalctl"]
+            };
+            want.extend(["--no-pager", "-n", "20", "-u", "x.service"]);
+            if follow {
+                want.push("-f");
+            }
+            assert_eq!(args, want, "follow={follow}");
+            assert!(!args.iter().any(|a| a == "--user" || a == "--system"));
+        }
+    }
+
+    #[test]
+    fn the_line_count_is_carried_through_verbatim() {
+        let (_, args) = program_and_args(&journal_command(Scope::User, "x.service", 1, false));
+        assert!(args.windows(2).any(|w| w == ["-n", "1"]), "{args:?}");
+    }
 
     #[test]
     fn user_unit_dir_follows_xdg_config_home() {

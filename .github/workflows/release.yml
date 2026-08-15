@@ -12,7 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            apt: musl-tools
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            apt: gcc-aarch64-linux-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,28 +27,81 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Install cross toolchain
+
+      - name: Install toolchain
         run: |
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            sudo apt-get update -q && sudo apt-get install -y musl-tools
-          else
-            cargo install cross --locked
-          fi
+          sudo apt-get update -q
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      # rustc emits static-pie for x86_64-unknown-linux-musl but not for
+      # aarch64-unknown-linux-musl: that target's built-in spec has
+      # "static-position-independent-executables": false, so rustc picks the
+      # "static-nopic-exe" link mode (crt1.o + `-static -no-pie`) and the
+      # binary comes out as a plain ELF EXEC with no ASLR.
+      #
+      # Everything needed for static-pie *is* shipped for the target (the
+      # self-contained sysroot has rcrt1.o / crtbeginS.o / crtendS.o, and the
+      # spec defines a "static-pic-exe" link mode) -- only the gate flag is off,
+      # and flipping it needs a custom target JSON, which in turn needs nightly
+      # + -Zbuild-std. So instead we wrap the linker and rewrite the link line
+      # into the static-pic-exe form. Stays on stable, keeps the binary fully
+      # static (no PT_INTERP, no runtime sysroot).
+      #
+      # Revisit if rust-lang/rust enables static-pie for aarch64 musl upstream:
+      # then this whole step and the RUSTFLAGS below can be deleted.
+      - name: Install static-pie linker wrapper (aarch64)
+        if: matrix.arch == 'aarch64'
+        run: |
+          cat > "$RUNNER_TEMP/staticpie-cc" <<'WRAPPER'
+          #!/bin/sh
+          set -e
+          args=""
+          for a in "$@"; do
+            case "$a" in
+              */self-contained/crt1.o)     a="${a%crt1.o}rcrt1.o" ;;
+              */self-contained/crtbegin.o) a="${a%crtbegin.o}crtbeginS.o" ;;
+              */self-contained/crtend.o)   a="${a%crtend.o}crtendS.o" ;;
+              -no-pie)                     a="-Wl,-pie" ;;
+              -static)                     a="-Wl,-static -Wl,--no-dynamic-linker -Wl,-z,text" ;;
+            esac
+            args="$args $a"
+          done
+          exec aarch64-linux-gnu-gcc $args
+          WRAPPER
+          chmod +x "$RUNNER_TEMP/staticpie-cc"
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$RUNNER_TEMP/staticpie-cc"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C relocation-model=pic"
+          } >> "$GITHUB_ENV"
+
       - name: Build
-        run: |
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            cargo build --release --target "${{ matrix.target }}"
-          else
-            cross build --release --target "${{ matrix.target }}"
-          fi
+        run: cargo build --release --target "${{ matrix.target }}"
+
       - name: Package
+        run: cp "target/${{ matrix.target }}/release/notcron" "notcron-linux-${{ matrix.arch }}"
+
+      # Hardening gate: both legs must ship a stripped, static-pie binary with
+      # no dynamic interpreter. Fail the release rather than publish a binary
+      # that silently lost ASLR or gained a runtime loader dependency.
+      - name: Verify static-pie
         run: |
-          arch=$(echo "${{ matrix.target }}" | cut -d- -f1)
-          cp "target/${{ matrix.target }}/release/notcron" "notcron-linux-$arch"
+          bin="notcron-linux-${{ matrix.arch }}"
+          file "$bin"
+          readelf -h "$bin" | grep -E 'Type|Machine'
+          [ "$(readelf -h "$bin" | awk '/^  Type:/ {print $2}')" = "DYN" ] \
+            || { echo "::error::$bin is not a PIE (expected ELF type DYN)"; exit 1; }
+          file "$bin" | grep -q 'static-pie linked' \
+            || { echo "::error::$bin is not static-pie linked"; exit 1; }
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "::error::$bin has a PT_INTERP segment (not statically linked)"
+            exit 1
+          fi
+          echo "OK: $bin is a static-pie executable with no dynamic interpreter"
+
       - uses: actions/upload-artifact@v4
         with:
           name: notcron-${{ matrix.target }}
-          path: notcron-linux-*
+          path: notcron-linux-${{ matrix.arch }}
 
   release:
     needs: build

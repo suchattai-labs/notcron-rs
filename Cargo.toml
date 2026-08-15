@@ -1,6 +1,6 @@
 [package]
 name = "notcron"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "systemd timer/service/mount manager with a builder TUI, instead of the crontab"
 license = "MIT"

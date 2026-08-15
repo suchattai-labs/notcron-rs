@@ -1,8 +1,8 @@
 //! notcron -- systemd timers, services and mounts without the crontab.
 //!
 //! With no arguments this is a full-screen builder for systemd units. The
-//! three subcommands (`list`, `remove`, `add`) exist so the same thing can be
-//! driven from a script.
+//! subcommands (`list`, `remove`, `add`, `export`, `trash`, `restore`) exist
+//! so the same thing can be driven from a script.
 
 mod cli;
 mod cron;
