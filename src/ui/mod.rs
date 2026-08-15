@@ -2,6 +2,7 @@ pub mod builder;
 pub mod dialogs;
 pub mod editor;
 pub mod list;
+pub mod optmenu;
 pub mod picker;
 pub mod term;
 

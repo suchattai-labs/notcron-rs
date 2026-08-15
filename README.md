@@ -153,7 +153,13 @@ on a day of the month, at boot after a delay, a cron expression, or a raw
 you edit.
 
 **Standalone service.** The same `[Service]` fields plus `Restart=` /
-`RestartSec=` and the `WantedBy=` target.
+`RestartSec=` and the `WantedBy=` target. The target list follows the scope,
+because the two managers do not share one: a system unit is offered
+`multi-user.target`, `graphical.target` and `network-online.target`, a user
+unit `default.target`, `basic.target` and `graphical-session.target`, and both
+`timers.target`. This matters — enabling a user unit into `multi-user.target`
+succeeds, creates the symlink, and then never starts, because the user manager
+has no such target. Switching scope moves the value with it.
 
 **Mount / automount.** `What` / `Where` / `Type` / `Options`, with presets for
 block devices, NFS, CIFS and bind mounts that fill in a sane fstype and
@@ -161,6 +167,55 @@ option string, plus an optional companion `.automount` with
 `TimeoutIdleSec=`. The unit filename is derived from the mount point using
 systemd's own escaping rules, implemented natively and tested against
 `systemd-escape --path`.
+
+### Mount options
+
+`Options` is a toggle menu, not a text field. It lists the options that are
+worth setting for the `Type=` you chose, ticks the ones already set, and shows
+the composed `Options=` string live as you work.
+
+| key | action |
+|---|---|
+| `Space` | toggle the option under the cursor |
+| `Enter` | toggle a flag, or prompt for a `key=value` option's value |
+| `?` | the full explanation of the focused option |
+| `Delete` | clear the option |
+| `Ctrl-S` | apply |
+| `Esc` | discard (confirmed, if you changed anything) |
+
+Every filesystem gets `ro`/`rw`, `noatime`/`relatime`, `nofail`, `noexec`,
+`nosuid`, `nodev`, `defaults` and `_netdev`. On top of that, NFS adds `vers=`,
+`hard`/`soft`, `timeo=`, `retrans=`, `rsize=`/`wsize=` and `bg`/`fg`; CIFS adds
+`credentials=` (which opens the file picker), `username=`, `uid=`/`gid=`,
+`vers=` and `iocharset=`; a bind mount adds `bind`/`rbind`.
+
+Options that contradict each other are one setting with two positions rather
+than two checkboxes — turning on `ro` turns off `rw`, in place, so the option
+that wins is not decided by which you happened to click last. Value prompts
+are seeded from the documented example for that option, and a value containing
+a comma is refused, since it would silently become two options.
+
+**`x-systemd.*` options are deliberately absent.** `x-systemd.automount`,
+`x-systemd.requires=`, `x-systemd.device-timeout=`, `x-systemd.mount-timeout=`,
+`x-systemd.makefs` and `x-systemd.growfs` are read by
+`systemd-fstab-generator`, which is not involved in a unit file at all: put
+`x-systemd.automount` in a `.mount` unit and no automount unit is generated,
+put `x-systemd.requires=` there and no `Requires=` appears. Both were probed
+on a live host to confirm it. For automounting, use the builder's **companion
+`.automount`** toggle, which writes the real unit; for a dependency, write
+`Requires=`/`After=` in the manual block. (`nofail` and `_netdev` were probed
+the same way and *are* honoured in a unit file, so both stay on the menu.)
+
+Options the menu does not offer are never lost. Anything it cannot represent —
+the `x-systemd.*` family, `file_mode=`, an option from a filesystem you are not
+using — is collected into an **other options** entry, editable as free text and
+written back in its original position. Opening someone else's mount unit,
+changing one thing and saving cannot silently drop the rest, which is the same
+bargain the manual block strikes for directives elsewhere.
+
+The per-option help is generated from `docs/field-help.md`, which is embedded
+at build time; the text you read in the TUI and the text in the repo are the
+same string.
 
 Every builder has a **manual directives** row that drops into a free-text
 editor for arbitrary extra lines — whole `[Section]` blocks are fine. That is

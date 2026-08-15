@@ -6,6 +6,7 @@
 
 mod cli;
 mod cron;
+mod fieldhelp;
 mod systemd;
 mod ui;
 mod unit;

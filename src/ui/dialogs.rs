@@ -112,10 +112,13 @@ pub fn prompt(
             err.clone(),
         );
         draw_over(term, bg, &mut |f| {
-            let area = popup_rect(f.area(), 74, 9);
-            f.render_widget(Clear, area);
-            // Keep the tail of a long value visible while typing.
-            let inner_w = area.width.saturating_sub(4) as usize;
+            // The width is fixed, so the wrapped height can be measured
+            // before the rect is chosen. It has to be: a multi-line help --
+            // a field summary plus its examples -- used to push the error
+            // and the keybindings out of a box that was always nine rows,
+            // which meant a rejected value looked like a dead key.
+            let width = 74u16.min(f.area().width.saturating_sub(2)).max(1);
+            let inner_w = width.saturating_sub(4) as usize;
             let shown: String = if v.chars().count() > inner_w {
                 v.chars().skip(v.chars().count() - inner_w).collect()
             } else {
@@ -129,6 +132,9 @@ pub fn prompt(
                     format!("  ! {e}")
                 }
             );
+            let height = wrapped_height(&body, inner_w.max(1)) as u16 + 2;
+            let area = popup_rect(f.area(), width, height);
+            f.render_widget(Clear, area);
             f.render_widget(
                 Paragraph::new(body)
                     .wrap(Wrap { trim: false })
@@ -166,6 +172,41 @@ pub fn prompt(
 /// Anything is accepted.
 pub fn no_validation(_: &str) -> Result<(), String> {
     Ok(())
+}
+
+/// How many lines `text` occupies once word-wrapped at `width`, matching what
+/// `Paragraph` with `Wrap` does closely enough to size a box around it.
+///
+/// A word longer than the width is not broken by this count but is by the
+/// renderer, so it is charged the rows it will actually take.
+pub fn wrapped_height(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 0usize;
+    for line in text.split('\n') {
+        let mut used = 0usize;
+        let mut wrote = false;
+        for word in line.split_whitespace() {
+            let w = word.chars().count();
+            if wrote && used + 1 + w > width {
+                rows += 1;
+                used = 0;
+                wrote = false;
+            }
+            if wrote {
+                used += 1;
+            }
+            // An over-long word spills onto further rows of its own.
+            if w > width {
+                rows += (w - 1) / width;
+                used = w % width;
+            } else {
+                used += w;
+            }
+            wrote = true;
+        }
+        rows += 1;
+    }
+    rows
 }
 
 /// Vertical list picker. Returns the chosen index, or `None` on Escape.
@@ -283,5 +324,59 @@ pub fn pager(term: &mut Term, bg: Background, title: &str, body: &str) {
                 _ => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapping_counts_plain_lines() {
+        assert_eq!(wrapped_height("", 20), 1);
+        assert_eq!(wrapped_height("short", 20), 1);
+        assert_eq!(wrapped_height("a\nb\nc", 20), 3);
+        // Blank lines still occupy a row.
+        assert_eq!(wrapped_height("a\n\nb", 20), 3);
+    }
+
+    #[test]
+    fn wrapping_counts_the_rows_a_paragraph_really_takes() {
+        // 30 characters of words at width 10 cannot fit on fewer than 3 rows.
+        let text = "one two three four five six seven";
+        for width in [8usize, 10, 20, 40] {
+            let rows = wrapped_height(text, width);
+            assert!(rows >= text.len().div_ceil(width), "{width}: {rows}");
+            assert!(rows <= text.split_whitespace().count(), "{width}: {rows}");
+        }
+        // A single unbreakable word spills across rows.
+        assert_eq!(wrapped_height(&"x".repeat(25), 10), 3);
+        assert_eq!(wrapped_height(&"x".repeat(10), 10), 1);
+    }
+
+    /// The prompt sizes itself from its help text. A field summary plus its
+    /// examples runs to several lines, and the box has to keep the error and
+    /// the keybindings visible underneath -- otherwise a rejected value is
+    /// indistinguishable from a dead keyboard.
+    #[test]
+    fn a_prompt_box_grows_to_fit_a_long_help_and_its_error() {
+        let help = "Read username/password from a root-only file instead of the \
+                    options string.\n\n  Examples: credentials=/etc/cifs-credentials, \
+                    credentials=/root/.smbcreds-nas";
+        let body = format!(
+            "{help}\n\n  /etc/creds_\n\n  ! a value cannot contain a comma; it \
+             separates options\n  Enter accepts, Esc cancels"
+        );
+        let inner_w = 70usize;
+        let height = wrapped_height(&body, inner_w) + 2;
+        assert!(height > 9, "the old fixed height would have clipped this");
+        // Everything fits: the box is at least as tall as the text plus its
+        // two border rows.
+        assert!(height >= body.lines().count() + 2);
+        // And it still fits on a normal terminal.
+        assert!(
+            height <= 24,
+            "{height} rows is too tall for an 80x24 screen"
+        );
     }
 }

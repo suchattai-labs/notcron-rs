@@ -41,6 +41,43 @@ impl Scope {
             Scope::System => "--system",
         }
     }
+
+    /// `WantedBy=` targets that actually exist in this scope.
+    ///
+    /// The two managers do not share a target set, and enabling a unit into a
+    /// target the manager has never heard of fails silently: the symlink is
+    /// created, nothing ever pulls it in, and the service simply never
+    /// starts. `multi-user.target`, `graphical.target` and
+    /// `network-online.target` are system-manager targets with no user-scope
+    /// equivalent; the user manager reaches `default.target` (aliased to
+    /// `basic.target` or a session target) instead. `timers.target` is the
+    /// one both provide, which is why timers can ignore all of this.
+    pub fn install_targets(self) -> &'static [&'static str] {
+        match self {
+            Scope::System => &[
+                "multi-user.target",
+                "graphical.target",
+                "network-online.target",
+                "timers.target",
+            ],
+            Scope::User => &[
+                "default.target",
+                "basic.target",
+                "graphical-session.target",
+                "timers.target",
+            ],
+        }
+    }
+
+    /// The target a new standalone service is installed into.
+    pub fn default_install_target(self) -> &'static str {
+        self.install_targets()[0]
+    }
+
+    /// Whether `target` is one this scope's manager can pull in.
+    pub fn has_install_target(self, target: &str) -> bool {
+        self.install_targets().contains(&target)
+    }
 }
 
 /// When a timer fires.
@@ -341,7 +378,13 @@ impl Unit {
             name: String::new(),
             description: String::new(),
             scope,
-            body: Body::Service(Box::default()),
+            body: Body::Service(Box::new(StandaloneService {
+                // A user-scope service enabled into multi-user.target is
+                // enabled into nothing at all, so the default follows the
+                // scope rather than being a constant.
+                wanted_by: scope.default_install_target().to_string(),
+                ..StandaloneService::default()
+            })),
         }
     }
 

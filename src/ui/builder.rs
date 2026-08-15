@@ -4,6 +4,7 @@
 
 use super::dialogs::{self, Background};
 use super::editor;
+use super::optmenu;
 use super::picker;
 use super::term::Term;
 use crate::cron::{self, Translation};
@@ -523,6 +524,15 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
             let cur = if u.scope == Scope::System { 1 } else { 0 };
             if let Some(i) = dialogs::pick(term, bg, "Scope", &items, cur) {
                 u.scope = if i == 1 { Scope::System } else { Scope::User };
+                // The two managers have different target sets, so a target
+                // that was valid before the switch may not be reachable
+                // after it. Moving it to the new scope's default is visible
+                // on the WantedBy row; leaving it would not be.
+                if let Body::Service(s) = &mut u.body {
+                    if !u.scope.has_install_target(&s.wanted_by) {
+                        s.wanted_by = u.scope.default_install_target().to_string();
+                    }
+                }
             }
         }
         Id::Schedule => {
@@ -670,16 +680,17 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
             }
         }
         Id::WantedBy => {
-            if let Body::Service(s) = &mut u.body {
-                let items = vec![
-                    "multi-user.target".to_string(),
-                    "default.target".to_string(),
-                    "graphical.target".to_string(),
-                    "network-online.target".to_string(),
-                ];
-                let cur = items.iter().position(|i| *i == s.wanted_by).unwrap_or(0);
-                if let Some(i) = dialogs::pick(term, bg, "WantedBy=", &items, cur) {
-                    s.wanted_by = items[i].clone();
+            // Only the targets this scope's manager actually has: enabling
+            // into one it does not know about is accepted and then never
+            // pulls the unit in.
+            let Body::Service(_) = &u.body else { return };
+            let current = current_wanted_by(u);
+            let choices = wanted_by_choices(u.scope, &current);
+            let labels: Vec<String> = choices.iter().map(|(_, l)| l.clone()).collect();
+            let cur = choices.iter().position(|(v, _)| *v == current).unwrap_or(0);
+            if let Some(i) = dialogs::pick(term, bg, "WantedBy=", &labels, cur) {
+                if let Body::Service(s) = &mut u.body {
+                    s.wanted_by = choices[i].0.clone();
                 }
             }
         }
@@ -750,15 +761,10 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
             }
         }
         Id::Options => {
-            if let Body::Mount(m) = &mut u.body {
-                if let Some(v) = dialogs::prompt(
-                    term,
-                    bg,
-                    "Options",
-                    "Comma-separated mount options, as in fstab.",
-                    &m.options,
-                    &dialogs::no_validation,
-                ) {
+            let Body::Mount(m) = &u.body else { return };
+            let (options, fstype) = (m.options.clone(), m.fstype.clone());
+            if let Some(v) = optmenu::run(term, bg, &options, &fstype) {
+                if let Body::Mount(m) = &mut u.body {
                     m.options = v;
                 }
             }
@@ -813,6 +819,39 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
         Id::Preview => preview(term, bg, u),
         Id::Save => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// Install target
+// ---------------------------------------------------------------------------
+
+/// The `WantedBy=` a unit currently carries; empty for bodies that have none.
+fn current_wanted_by(u: &Unit) -> String {
+    match &u.body {
+        Body::Service(s) => s.wanted_by.clone(),
+        _ => String::new(),
+    }
+}
+
+/// `(value, label)` for every target offerable in `scope`.
+///
+/// A target the unit already names but this scope does not provide is kept at
+/// the end and flagged, rather than dropped: it is what the file on disk says
+/// and hiding it would make the picker lie about the current value. Everything
+/// above it is a target the manager can genuinely reach.
+fn wanted_by_choices(scope: Scope, current: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = scope
+        .install_targets()
+        .iter()
+        .map(|t| (t.to_string(), t.to_string()))
+        .collect();
+    if !current.is_empty() && !scope.has_install_target(current) {
+        out.push((
+            current.to_string(),
+            format!("{current}   (no such target in {} scope)", scope.as_str()),
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,6 +1432,123 @@ mod tests {
             "name follows the mount point: {}",
             m.name
         );
+    }
+
+    /// The bug this guards: the builder used to offer the system manager's
+    /// target list whatever the scope was, so a user-scope service could be
+    /// enabled into `multi-user.target` -- accepted by systemctl, and then
+    /// never started, because the user manager has no such target.
+    #[test]
+    fn wanted_by_offers_only_targets_the_scope_actually_has() {
+        let user: Vec<String> = wanted_by_choices(Scope::User, "")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        for absent in [
+            "multi-user.target",
+            "graphical.target",
+            "network-online.target",
+        ] {
+            assert!(
+                !user.contains(&absent.to_string()),
+                "{absent} offered to a user unit"
+            );
+        }
+        assert!(user.contains(&"default.target".to_string()));
+        assert!(user.contains(&"basic.target".to_string()));
+
+        let system: Vec<String> = wanted_by_choices(Scope::System, "")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        assert!(system.contains(&"multi-user.target".to_string()));
+        for absent in ["default.target", "basic.target", "graphical-session.target"] {
+            assert!(
+                !system.contains(&absent.to_string()),
+                "{absent} offered to a system unit"
+            );
+        }
+
+        // timers.target is the one both managers provide.
+        assert!(user.contains(&"timers.target".to_string()));
+        assert!(system.contains(&"timers.target".to_string()));
+    }
+
+    #[test]
+    fn a_new_service_defaults_to_a_target_its_scope_can_reach() {
+        for scope in [Scope::User, Scope::System] {
+            let u = Unit::new_service(scope);
+            let target = current_wanted_by(&u);
+            assert!(
+                scope.has_install_target(&target),
+                "{scope:?} defaults to {target}, which it does not have"
+            );
+        }
+        assert_eq!(
+            current_wanted_by(&Unit::new_service(Scope::User)),
+            "default.target"
+        );
+        assert_eq!(
+            current_wanted_by(&Unit::new_service(Scope::System)),
+            "multi-user.target"
+        );
+    }
+
+    /// A target read off disk that this scope cannot reach is still shown --
+    /// it is what the file says -- but flagged, and it never displaces a real
+    /// choice at the top of the list.
+    #[test]
+    fn a_foreign_target_is_kept_and_flagged_rather_than_hidden() {
+        let choices = wanted_by_choices(Scope::User, "multi-user.target");
+        assert_eq!(choices.len(), Scope::User.install_targets().len() + 1);
+        let (value, label) = choices.last().expect("the foreign target");
+        assert_eq!(value, "multi-user.target");
+        assert!(label.contains("no such target"), "{label}");
+        // A target the scope does have is not duplicated.
+        assert_eq!(
+            wanted_by_choices(Scope::User, "default.target").len(),
+            Scope::User.install_targets().len()
+        );
+    }
+
+    #[test]
+    fn only_service_bodies_report_a_wanted_by() {
+        assert_eq!(current_wanted_by(&Unit::new_timer(Scope::User)), "");
+        assert_eq!(current_wanted_by(&Unit::new_mount()), "");
+    }
+
+    #[test]
+    fn the_mount_options_row_opens_the_menu_for_the_current_fstype() {
+        use crate::unit::mountopts::{self, Family};
+        // The row the menu hangs off exists on every mount, and the fstype
+        // it is opened with is the one that decides the offered set.
+        for preset in MountPreset::ALL {
+            let mut u = Unit::new_mount();
+            if let Body::Mount(m) = &mut u.body {
+                m.preset = preset;
+                m.fstype = preset.fstype().into();
+                m.options = preset.options().into();
+            }
+            assert!(rows_for(&u).iter().any(|r| r.id == Id::Options));
+            let Body::Mount(m) = &u.body else {
+                unreachable!()
+            };
+            let st = optmenu::State::new(&m.options, &m.fstype);
+            assert_eq!(st.set.text(), m.options, "{}", preset.label());
+            let expected = match preset {
+                MountPreset::Nfs => Family::Nfs,
+                MountPreset::Cifs => Family::Cifs,
+                MountPreset::Bind => Family::Bind,
+                MountPreset::Block => Family::Generic,
+            };
+            assert_eq!(st.set.family(), expected, "{}", preset.label());
+            assert_eq!(
+                mountopts::family_for(&m.fstype),
+                expected,
+                "{}",
+                preset.label()
+            );
+        }
     }
 
     #[test]
