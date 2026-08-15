@@ -6,6 +6,7 @@
 //! here panics: every I/O and subprocess failure comes back as an `Err` with
 //! a message fit to show the user.
 
+use crate::trash::{PrunePolicy, StashRequest, Trash, TrashEntry};
 use crate::unit::generate::{self, RenderedFile};
 use crate::unit::model::{Scope, Unit};
 use crate::unit::parse::{self, SourceFile};
@@ -39,7 +40,9 @@ fn need_sudo(scope: Scope) -> bool {
     scope == Scope::System && !is_root()
 }
 
-fn is_root() -> bool {
+/// True when the process is running as root, so no `sudo` is needed.
+/// [`crate::trash`] asks the same question before elevating its own writes.
+pub fn is_root() -> bool {
     // Cheap and dependency-free: /proc/self is owned by the process euid, but
     // reading the effective uid from `id -u` output is not worth a fork. The
     // USER-independent check is the metadata of /proc/self.
@@ -103,6 +106,25 @@ pub fn systemctl_lossy(scope: Scope, args: &[&str]) -> String {
 
 pub fn daemon_reload(scope: Scope) -> Result<String, String> {
     systemctl(scope, &["daemon-reload"])
+}
+
+/// Whether a unit is enabled. `is-enabled` exits non-zero for every state
+/// that is not "enabled", so the exit status is not the answer — the word it
+/// prints is. `enabled-runtime` counts, since the unit really is wired up.
+pub fn is_enabled(scope: Scope, unit: &str) -> bool {
+    matches!(
+        systemctl_lossy(scope, &["is-enabled", unit]).trim(),
+        "enabled" | "enabled-runtime"
+    )
+}
+
+/// Whether a unit is currently running. `is-active` exits non-zero for an
+/// inactive unit by design, so again the printed word is the answer.
+pub fn is_active(scope: Scope, unit: &str) -> bool {
+    matches!(
+        systemctl_lossy(scope, &["is-active", unit]).trim(),
+        "active" | "activating" | "reloading"
+    )
 }
 
 /// Recent journal entries for a unit.
@@ -436,24 +458,123 @@ pub fn install(u: &Unit, enable: bool, start: bool) -> Result<InstallReport, Str
     Ok(report)
 }
 
-/// Stop, disable, delete and forget a unit. Best-effort on the systemctl
-/// steps: a unit that was never enabled must still be removable.
+/// What a removal did, beyond succeeding.
+#[derive(Debug, Default)]
+pub struct RemoveReport {
+    /// The trash entry the unit's files were stashed into, so the caller can
+    /// offer an undo. `None` only when there was nothing on disk to stash.
+    pub trashed: Option<TrashEntry>,
+    /// Non-fatal problems, e.g. the retention prune failing. The removal
+    /// itself happened.
+    pub warnings: Vec<String>,
+}
+
+/// Stop, disable, delete and forget a unit.
+///
+/// This is the only path that deletes unit files, and it never deletes them
+/// outright: the files are *moved* into the scope's trash
+/// ([`crate::trash`]) so the removal can be undone. Both the `notcron remove`
+/// CLI and the TUI go through here, so undo exists regardless of entry point.
+///
+/// # Stash failure aborts the removal
+///
+/// If the files cannot be stashed the unit is **not** deleted and an error is
+/// returned. Refusing to delete what could not be backed up is the only
+/// choice that cannot lose a user's work; the alternative — deleting anyway
+/// with a warning — turns a full disk or a missing `sudo` rule into silent
+/// data loss, on the one operation a user is most likely to regret. A stash
+/// is all-or-nothing (see [`Trash::stash`]), so an abort leaves every file
+/// where it was. The unit may already have been stopped and disabled by the
+/// time the stash is attempted, which the error says.
+///
+/// Best-effort on the systemctl steps otherwise: a unit that was never
+/// enabled must still be removable.
 pub fn remove(scope: Scope, files: &[String]) -> Result<(), String> {
-    let dir = unit_dir(scope);
-    if let Some(primary) = files.first() {
-        let _ = systemctl(scope, &["disable", "--now", primary]);
+    remove_reporting(scope, files).map(|_| ())
+}
+
+/// [`remove`] with the trash entry and any warnings, for callers that offer
+/// an undo affordance.
+pub fn remove_reporting(scope: Scope, files: &[String]) -> Result<RemoveReport, String> {
+    // Ask before disabling, or the answer is always "no".
+    let primary = files.first().cloned().unwrap_or_default();
+    let (was_enabled, was_active) = if primary.is_empty() {
+        (false, false)
+    } else {
+        (is_enabled(scope, &primary), is_active(scope, &primary))
+    };
+
+    if !primary.is_empty() {
+        let _ = systemctl(scope, &["disable", "--now", &primary]);
     }
     for f in files {
         let _ = systemctl(scope, &["stop", f]);
     }
-    for f in files {
-        remove_file(scope, &dir.join(f))?;
-    }
+
+    let report = stash_and_delete(
+        scope,
+        &unit_dir(scope),
+        &Trash::for_scope(scope),
+        files,
+        was_enabled,
+        was_active,
+    )?;
+
     daemon_reload(scope)?;
     let mut args = vec!["reset-failed"];
     args.extend(files.iter().map(String::as_str));
     let _ = systemctl(scope, &args);
-    Ok(())
+    Ok(report)
+}
+
+/// The half of [`remove_reporting`] that touches files, with the unit
+/// directory and the trash passed in so it can be exercised against a
+/// temporary directory instead of the real system paths.
+fn stash_and_delete(
+    scope: Scope,
+    dir: &std::path::Path,
+    trash: &Trash,
+    files: &[String],
+    was_enabled: bool,
+    was_active: bool,
+) -> Result<RemoveReport, String> {
+    let paths: Vec<PathBuf> = files.iter().map(|f| dir.join(f)).collect();
+    let mut report = RemoveReport::default();
+
+    let present: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
+    if !present.is_empty() {
+        let req = StashRequest {
+            scope,
+            unit: files.first().cloned().unwrap_or_default(),
+            files: present,
+            was_enabled,
+            was_active,
+        };
+        match trash.stash(&req) {
+            Ok(entry) => report.trashed = Some(entry),
+            Err(e) => {
+                return Err(format!(
+                    "{} was stopped and disabled but NOT deleted: its files could \
+                     not be moved to the trash at {}, and notcron will not delete \
+                     what it cannot undo.\n\n{e}",
+                    files.first().map(String::as_str).unwrap_or("the unit"),
+                    trash.root().display()
+                ))
+            }
+        }
+        // Keep the trash from growing without bound. A failure here is
+        // cosmetic: the removal already succeeded.
+        if let Err(e) = trash.prune(PrunePolicy::DEFAULT) {
+            report.warnings.push(format!("pruning the trash: {e}"));
+        }
+    }
+
+    // The stash moved the files out, so this only catches anything it left
+    // behind: a path that reappeared, or a unit whose files were already gone.
+    for p in &paths {
+        remove_file(scope, p)?;
+    }
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +760,136 @@ mod tests {
             unit_dir(Scope::System),
             PathBuf::from("/etc/systemd/system")
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Removal stashes instead of deleting
+    //
+    // These drive `stash_and_delete`, the half of `remove` that touches
+    // files, against a temporary unit directory and a temporary trash. The
+    // systemctl calls `remove` wraps around it are best-effort and cannot be
+    // staged in a unit test; what must not regress is that no unit file is
+    // ever deleted without a restorable copy existing first.
+    // -----------------------------------------------------------------
+
+    use crate::trash::Trash;
+    use tempfile::TempDir;
+
+    const TIMER: &str = "notcron-e2e.timer";
+    const SERVICE: &str = "notcron-e2e.service";
+
+    /// A unit directory holding two files with distinctive bodies.
+    fn staged(dir: &std::path::Path) -> (String, String) {
+        std::fs::create_dir_all(dir).unwrap();
+        let timer = "[Unit]\nDescription=e2e\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\n";
+        let service = "[Unit]\nDescription=e2e\n\n[Service]\nExecStart=/bin/true\n";
+        std::fs::write(dir.join(TIMER), timer).unwrap();
+        std::fs::write(dir.join(SERVICE), service).unwrap();
+        (timer.into(), service.into())
+    }
+
+    fn names() -> Vec<String> {
+        vec![TIMER.to_string(), SERVICE.to_string()]
+    }
+
+    #[test]
+    fn removal_stashes_the_files_instead_of_deleting_them() {
+        let tmp = TempDir::new().unwrap();
+        let units = tmp.path().join("units");
+        let trash = Trash::at(tmp.path().join("trash"));
+        staged(&units);
+
+        let report = stash_and_delete(Scope::User, &units, &trash, &names(), true, false).unwrap();
+
+        // Gone from the unit directory...
+        assert!(!units.join(TIMER).exists());
+        assert!(!units.join(SERVICE).exists());
+        // ...but recoverable.
+        let entry = report.trashed.expect("removal should have stashed");
+        assert_eq!(entry.unit, TIMER);
+        assert_eq!(entry.files.len(), 2);
+        assert!(entry.was_enabled);
+        assert!(!entry.was_active);
+        // The metadata is on disk, not just in the returned value.
+        assert_eq!(trash.list().unwrap()[0].id, entry.id);
+    }
+
+    #[test]
+    fn remove_then_restore_returns_the_original_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let units = tmp.path().join("units");
+        let trash = Trash::at(tmp.path().join("trash"));
+        let (timer_body, service_body) = staged(&units);
+
+        let report = stash_and_delete(Scope::User, &units, &trash, &names(), true, true).unwrap();
+        let id = report.trashed.unwrap().id;
+
+        let restored = trash.restore(&id, false).unwrap();
+        assert_eq!(restored.restored.len(), 2);
+        // Restore reports what it saw at removal time, so a caller can offer
+        // to re-enable and restart.
+        assert!(restored.was_enabled);
+        assert!(restored.was_active);
+
+        assert_eq!(
+            std::fs::read_to_string(units.join(TIMER)).unwrap(),
+            timer_body
+        );
+        assert_eq!(
+            std::fs::read_to_string(units.join(SERVICE)).unwrap(),
+            service_body
+        );
+        // A restored entry leaves nothing behind in the trash.
+        assert!(trash.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_stash_aborts_the_removal_and_deletes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let units = tmp.path().join("units");
+        staged(&units);
+
+        // A trash root that cannot be created: the path runs *through* a
+        // regular file, so mkdir -p fails with ENOTDIR.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let trash = Trash::at(blocker.join("trash"));
+
+        let err = stash_and_delete(Scope::User, &units, &trash, &names(), false, false)
+            .expect_err("a trash that cannot be written must abort the removal");
+        assert!(err.contains("NOT deleted"), "{err}");
+
+        // The whole point: refusing to back up means refusing to delete.
+        assert!(units.join(TIMER).exists());
+        assert!(units.join(SERVICE).exists());
+    }
+
+    #[test]
+    fn a_unit_whose_files_are_already_gone_removes_without_a_trash_entry() {
+        let tmp = TempDir::new().unwrap();
+        let units = tmp.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        let trash = Trash::at(tmp.path().join("trash"));
+
+        // Nothing on disk is not a failure: there is nothing to lose, so the
+        // removal proceeds and simply has no undo to offer.
+        let report = stash_and_delete(Scope::User, &units, &trash, &names(), false, false).unwrap();
+        assert!(report.trashed.is_none());
+        assert!(trash.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removal_prunes_the_trash_to_the_default_retention() {
+        let tmp = TempDir::new().unwrap();
+        let units = tmp.path().join("units");
+        let trash = Trash::at(tmp.path().join("trash"));
+
+        // More removals than PrunePolicy::DEFAULT keeps.
+        for _ in 0..55 {
+            staged(&units);
+            stash_and_delete(Scope::User, &units, &trash, &names(), false, false).unwrap();
+        }
+        assert_eq!(trash.list().unwrap().len(), 50);
     }
 
     #[test]

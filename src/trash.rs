@@ -16,15 +16,27 @@
 //! scalar fields plus a repeated `file=` line. See [`TrashEntry::encode`].
 //!
 //! Nothing here panics; every I/O failure comes back as an `Err` with a
-//! message fit to show the user. Writes go straight to the filesystem with no
-//! `sudo` escalation, so system-scope trash under `/var/lib/notcron` requires
-//! the process to already be root — the error message says so.
+//! message fit to show the user.
+//!
+//! # Privilege
+//!
+//! System-scope trash lives under `/var/lib/notcron`, which is root-owned, so
+//! a [`Trash::for_scope(Scope::System)`](Trash::for_scope) built by a non-root
+//! process performs its *writes* through `sudo -n`, exactly as
+//! [`crate::systemd`] does for `/etc/systemd/system`. Reads are never
+//! elevated: everything root writes here lands world-readable (0755 dirs,
+//! 0644 files), so listing and restoring decisions need no password.
+//!
+//! User scope never shells out to `sudo`, and neither does [`Trash::at`], so
+//! tests and any explicitly-rooted trash stay pure filesystem calls.
 
 use crate::unit::model::Scope;
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// First line of every metadata record, so a future format change can be
@@ -95,11 +107,6 @@ pub struct TrashEntry {
 }
 
 impl TrashEntry {
-    /// `YYYY-MM-DD HH:MM:SS UTC`, for a TUI table column.
-    pub fn removed_at_utc(&self) -> String {
-        format_utc(self.removed_at)
-    }
-
     /// Age in seconds relative to `now` (saturating, so a clock that went
     /// backwards reads as zero rather than wrapping).
     pub fn age_secs(&self, now: u64) -> u64 {
@@ -261,6 +268,7 @@ impl PrunePolicy {
     };
 
     /// Keep everything. Useful in tests and for an explicit opt-out.
+    #[cfg(test)]
     pub const UNLIMITED: PrunePolicy = PrunePolicy {
         max_entries: None,
         max_age_secs: None,
@@ -282,23 +290,41 @@ impl Default for PrunePolicy {
 #[derive(Debug, Clone)]
 pub struct Trash {
     root: PathBuf,
+    /// Route writes through `sudo -n`. Set only by [`Trash::for_scope`] for
+    /// system scope when the process is not already root.
+    sudo: bool,
 }
 
 impl Trash {
     /// The trash for a scope, at the location [`trash_dir`] describes.
+    ///
+    /// System scope writes through `sudo -n` unless already running as root;
+    /// user scope never does.
     pub fn for_scope(scope: Scope) -> Trash {
         Trash {
             root: trash_dir(scope),
+            sudo: scope == Scope::System && !crate::systemd::is_root(),
         }
     }
 
-    /// A trash rooted at an arbitrary directory.
+    /// A trash rooted at an arbitrary directory, writing as the current user.
+    /// Used by tests and anywhere the caller has already arranged access.
+    #[cfg(test)]
     pub fn at(root: impl Into<PathBuf>) -> Trash {
-        Trash { root: root.into() }
+        Trash {
+            root: root.into(),
+            sudo: false,
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Whether this trash escalates its writes.
+    #[cfg(test)]
+    pub fn uses_sudo(&self) -> bool {
+        self.sudo
     }
 
     /// Move a removed unit's files into a new trash entry.
@@ -307,6 +333,11 @@ impl Trash {
     /// the trash is on a different filesystem (`rename` fails with `EXDEV`).
     /// Missing source files are skipped; if none of them exist the call is an
     /// error, because an entry with no files cannot be restored.
+    ///
+    /// A stash either completes or leaves the filesystem as it found it: if a
+    /// move fails part way through, the files already moved are put back and
+    /// the half-built entry directory is removed. Callers can therefore treat
+    /// an `Err` as "nothing happened" and refuse to go on deleting.
     pub fn stash(&self, req: &StashRequest) -> Result<TrashEntry, String> {
         self.stash_at(req, now_secs())
     }
@@ -316,14 +347,14 @@ impl Trash {
         if req.files.is_empty() {
             return Err("nothing to stash: no files given".into());
         }
-        create_dir(&self.root)?;
+        create_dir(&self.root, self.sudo)?;
         let dir = self.unique_entry_dir(&req.unit, now)?;
         let id = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let mut files = Vec::new();
+        let mut files: Vec<TrashedFile> = Vec::new();
         for (i, src) in req.files.iter().enumerate() {
             if !src.exists() {
                 continue; // already gone: not a reason to fail the removal
@@ -337,14 +368,17 @@ impl Trash {
             } else {
                 base
             };
-            move_file(src, &dir.join(&stored), true)?;
+            if let Err(e) = move_file(src, &dir.join(&stored), true, self.sudo) {
+                self.unwind(&dir, &files);
+                return Err(e);
+            }
             files.push(TrashedFile {
                 stored,
                 original: src.clone(),
             });
         }
         if files.is_empty() {
-            let _ = fs::remove_dir_all(&dir);
+            self.unwind(&dir, &[]);
             return Err("nothing to stash: none of the unit's files exist".into());
         }
 
@@ -357,9 +391,22 @@ impl Trash {
             was_active: req.was_active,
             files,
         };
-        fs::write(dir.join(META_NAME), entry.encode())
-            .map_err(|e| format!("writing {}: {e}", dir.join(META_NAME).display()))?;
+        if let Err(e) = write_file(&dir.join(META_NAME), &entry.encode(), self.sudo) {
+            self.unwind(&dir, &entry.files);
+            return Err(e);
+        }
         Ok(entry)
+    }
+
+    /// Roll a failed stash back: return everything already moved to where it
+    /// came from and drop the entry directory. Best effort by construction —
+    /// the caller is already returning an error, and a rollback that cannot
+    /// finish must not mask it.
+    fn unwind(&self, dir: &Path, moved: &[TrashedFile]) {
+        for f in moved {
+            let _ = move_file(&dir.join(&f.stored), &f.original, true, self.sudo);
+        }
+        let _ = remove_tree(dir, self.sudo);
     }
 
     /// Every readable entry, newest first. Unreadable or malformed entries are
@@ -442,13 +489,12 @@ impl Trash {
                     entry.id, f.stored
                 )));
             }
-            move_file(&src, &f.original, true).map_err(RestoreError::Io)?;
+            move_file(&src, &f.original, true, self.sudo).map_err(RestoreError::Io)?;
             restored.push(f.original.clone());
         }
         // Only the metadata should be left; dropping the directory keeps the
         // trash from accumulating empty husks.
-        let _ = fs::remove_file(dir.join(META_NAME));
-        let _ = fs::remove_dir(&dir);
+        let _ = remove_tree(&dir, self.sudo);
 
         Ok(RestoreReport {
             unit: entry.unit,
@@ -468,7 +514,7 @@ impl Trash {
             Err(e) => return Err(e.to_string()),
         };
         let dir = self.root.join(&entry.id);
-        fs::remove_dir_all(&dir).map_err(|e| format!("removing {}: {e}", dir.display()))
+        remove_tree(&dir, self.sudo)
     }
 
     /// Apply a retention policy, deleting the entries it excludes. Returns the
@@ -499,10 +545,16 @@ impl Trash {
                 format!("{stamp}-{slug}-{n}")
             };
             let dir = self.root.join(&name);
-            match fs::create_dir(&dir) {
+            // `sudo mkdir` reports an already-existing directory as a generic
+            // failure, so the existence check comes first either way; the
+            // create is still the thing that claims the name.
+            if dir.exists() {
+                continue;
+            }
+            match make_dir(&dir, self.sudo) {
                 Ok(()) => return Ok(dir),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("creating {}: {e}", dir.display())),
+                Err(_) if dir.exists() => continue,
+                Err(e) => return Err(e),
             }
         }
         Err("could not allocate a trash entry directory".into())
@@ -527,7 +579,41 @@ fn select_for_prune(entries: &[TrashEntry], policy: PrunePolicy, now: u64) -> Ve
 // Filesystem helpers
 // ---------------------------------------------------------------------------
 
-fn create_dir(path: &Path) -> Result<(), String> {
+/// Run an elevated helper and turn a non-zero exit into a usable message.
+///
+/// `sudo -n` never prompts: on a host without a password-less rule this fails
+/// immediately with "a password is required", which is the right answer for
+/// both the TUI and a provisioning script.
+fn sudo_run(cmd: &mut Command, what: &str) -> Result<(), String> {
+    let out = cmd
+        .stdout(Stdio::null())
+        .output()
+        .map_err(|e| format!("{what}: failed to run sudo: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(if msg.is_empty() {
+        format!("{what}: sudo failed")
+    } else {
+        format!("{what}: {msg}")
+    })
+}
+
+fn sudo() -> Command {
+    let mut c = Command::new("sudo");
+    c.arg("-n");
+    c
+}
+
+/// `mkdir -p`.
+fn create_dir(path: &Path, elevated: bool) -> Result<(), String> {
+    if elevated {
+        return sudo_run(
+            sudo().args(["mkdir", "-p"]).arg(path),
+            &format!("creating {}", path.display()),
+        );
+    }
     fs::create_dir_all(path).map_err(|e| {
         format!(
             "creating {}: {e}{}",
@@ -541,6 +627,67 @@ fn create_dir(path: &Path) -> Result<(), String> {
     })
 }
 
+/// `mkdir` without `-p`: creating the entry directory is how a trash id is
+/// claimed, so it must fail when the name is already taken.
+fn make_dir(path: &Path, elevated: bool) -> Result<(), String> {
+    if elevated {
+        return sudo_run(
+            sudo().arg("mkdir").arg(path),
+            &format!("creating {}", path.display()),
+        );
+    }
+    fs::create_dir(path).map_err(|e| format!("creating {}: {e}", path.display()))
+}
+
+/// Write a file, elevating through `tee` the way `systemd::write_file` does.
+fn write_file(path: &Path, body: &str, elevated: bool) -> Result<(), String> {
+    if !elevated {
+        return fs::write(path, body).map_err(|e| format!("writing {}: {e}", path.display()));
+    }
+    let mut child = sudo()
+        .arg("tee")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("writing {}: failed to run sudo tee: {e}", path.display()))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or("sudo tee has no stdin")?
+        .write_all(body.as_bytes())
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "writing {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// `rm -rf` on a trash entry directory. A directory that is already gone is
+/// success: discarding twice is not an error.
+fn remove_tree(path: &Path, elevated: bool) -> Result<(), String> {
+    if elevated {
+        return sudo_run(
+            sudo().args(["rm", "-rf"]).arg(path),
+            &format!("removing {}", path.display()),
+        );
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("removing {}: {e}", path.display())),
+    }
+}
+
 /// `EXDEV`: rename across filesystems. The trash may well be on a different
 /// mount from `/etc/systemd/system`, so this is the expected failure.
 const EXDEV: i32 = 18;
@@ -548,9 +695,18 @@ const EXDEV: i32 = 18;
 /// Move a file, falling back to copy+unlink when `rename` cannot cross the
 /// filesystem boundary. `allow_rename` exists so the fallback path is
 /// reachable in tests without staging two real mounts.
-fn move_file(from: &Path, to: &Path, allow_rename: bool) -> Result<(), String> {
+fn move_file(from: &Path, to: &Path, allow_rename: bool, elevated: bool) -> Result<(), String> {
     if let Some(parent) = to.parent() {
-        create_dir(parent)?;
+        create_dir(parent, elevated)?;
+    }
+    if elevated {
+        // `mv` already does rename-then-copy across filesystems, and doing it
+        // in one elevated call keeps the file from ever existing in both
+        // places under two different owners.
+        return sudo_run(
+            sudo().args(["mv", "-f"]).arg(from).arg(to),
+            &format!("moving {} to {}", from.display(), to.display()),
+        );
     }
     if allow_rename {
         match fs::rename(from, to) {
@@ -688,12 +844,6 @@ fn compact_utc(secs: u64) -> String {
     format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z")
 }
 
-/// `2026-08-15 11:30:00 UTC` — for display.
-fn format_utc(secs: u64) -> String {
-    let (y, mo, d, h, mi, s) = split_utc(secs);
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,6 +873,66 @@ mod tests {
                 was_active: false,
             },
         )
+    }
+
+    /// Drop the write bit on a directory, which is what stops a file inside
+    /// it from being unlinked -- and therefore from being moved out.
+    fn set_writable(dir: &Path, writable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if writable { 0o755 } else { 0o555 };
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a_stash_that_fails_part_way_puts_back_what_it_moved() {
+        let tmp = TempDir::new().unwrap();
+        let movable = tmp.path().join("movable");
+        let pinned = tmp.path().join("pinned");
+        let first = movable.join("notcron-backup.timer");
+        let second = pinned.join("notcron-backup.service");
+        write(&first, "[Timer]\nOnCalendar=daily\n");
+        write(&second, "[Service]\nExecStart=/bin/true\n");
+        // The second file cannot leave its directory, so the stash fails
+        // after the first has already been moved into the entry.
+        set_writable(&pinned, false);
+
+        let trash = Trash::at(tmp.path().join("trash"));
+        let req = StashRequest {
+            scope: Scope::User,
+            unit: "notcron-backup.timer".into(),
+            files: vec![first.clone(), second.clone()],
+            was_enabled: false,
+            was_active: false,
+        };
+        let err = trash.stash(&req).expect_err("the second move must fail");
+        set_writable(&pinned, true); // so TempDir can clean up
+
+        assert!(err.contains("notcron-backup.service"), "{err}");
+        // Both files are where they started...
+        assert_eq!(
+            fs::read_to_string(&first).unwrap(),
+            "[Timer]\nOnCalendar=daily\n"
+        );
+        assert!(second.exists());
+        // ...and no half-built entry is left for the undo dialog to trip on.
+        assert!(trash.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_trash_for_user_scope_never_escalates() {
+        // The sudo path exists for /var/lib/notcron only; a user-scope trash
+        // under $HOME must stay ordinary filesystem calls.
+        assert!(!Trash::for_scope(Scope::User).uses_sudo());
+        // An explicitly-rooted trash never escalates either, whatever it
+        // points at -- that is what keeps the test suite off sudo.
+        assert!(!Trash::at("/var/lib/notcron/trash").uses_sudo());
+    }
+
+    #[test]
+    fn system_scope_escalates_exactly_when_not_root() {
+        let t = Trash::for_scope(Scope::System);
+        assert_eq!(t.uses_sudo(), !crate::systemd::is_root());
+        assert_eq!(t.root(), Path::new("/var/lib/notcron/trash"));
     }
 
     #[test]
@@ -805,7 +1015,7 @@ mod tests {
         let dst = tmp.path().join("dst/notcron-x.timer");
 
         // allow_rename = false stands in for EXDEV without staging two mounts.
-        move_file(&src, &dst, false).unwrap();
+        move_file(&src, &dst, false, false).unwrap();
         assert!(!src.exists());
         assert_eq!(fs::read_to_string(&dst).unwrap(), "body\n");
     }
@@ -984,24 +1194,6 @@ mod tests {
         ));
         assert!(trash.discard("nope").is_ok());
         assert!(trash.list().unwrap().is_empty());
-    }
-
-    #[test]
-    fn timestamps_render_as_utc() {
-        // Fixed epochs with independently known UTC values, so this test does
-        // not rot as the wall clock advances.
-        assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
-        assert_eq!(compact_utc(0), "19700101T000000Z");
-        assert_eq!(format_utc(1_000_000_000), "2001-09-09 01:46:40 UTC");
-        assert_eq!(compact_utc(1_000_000_000), "20010909T014640Z");
-        // Leap days in a 4-yearly and a 400-yearly leap year, to exercise the
-        // civil-date maths at its awkward points.
-        assert_eq!(format_utc(1_709_164_800), "2024-02-29 00:00:00 UTC");
-        assert_eq!(format_utc(951_782_400), "2000-02-29 00:00:00 UTC");
-        // Midnight and the last second of a day, derived rather than guessed.
-        let midnight = 951_782_400;
-        assert_eq!(format_utc(midnight + 86_399), "2000-02-29 23:59:59 UTC");
-        assert_eq!(format_utc(midnight + 86_400), "2000-03-01 00:00:00 UTC");
     }
 
     #[test]

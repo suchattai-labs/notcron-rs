@@ -1,10 +1,15 @@
 pub mod builder;
 pub mod dialogs;
+pub mod diff;
 pub mod editor;
+pub mod health;
 pub mod list;
+pub mod logtail;
 pub mod optmenu;
 pub mod picker;
+pub mod table;
 pub mod term;
+pub mod trashview;
 
 use crate::unit::model::Scope;
 use std::process::ExitCode;
@@ -34,11 +39,12 @@ pub fn self_check(scope: Scope) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let res = term.terminal.draw(|f| list::draw(f, &app)).map(|_| ());
+    let snap = app.snapshot();
+    let res = term.terminal.draw(|f| list::draw(f, &snap)).map(|_| ());
     drop(term);
     match res {
         Ok(()) => {
-            println!("notcron: TUI self-check ok ({} units)", app.entries.len());
+            println!("notcron: TUI self-check ok ({} units)", app.rows.len());
             ExitCode::SUCCESS
         }
         Err(e) => {

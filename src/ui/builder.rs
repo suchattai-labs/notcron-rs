@@ -3,6 +3,7 @@
 //! toggle, the schedule sub-builder, or the free-text manual editor.
 
 use super::dialogs::{self, Background};
+use super::diff;
 use super::editor;
 use super::optmenu;
 use super::picker;
@@ -1048,6 +1049,10 @@ fn status_line(u: &Unit, d: &Derived, id: Id) -> String {
 pub fn run(term: &mut Term, bg: Background, u: &mut Unit, title: &str) -> bool {
     let width = term.terminal.size().map(|s| s.width).unwrap_or(80);
     let mut v = View::new(u, title, default_pane(width));
+    // What the unit's files held when the editor opened. Compared against
+    // disk at save time so an edit made elsewhere in the meantime is shown
+    // rather than silently overwritten.
+    let baseline = baseline_of(u);
 
     loop {
         v.refocus(u);
@@ -1061,7 +1066,7 @@ pub fn run(term: &mut Term, bg: Background, u: &mut Unit, title: &str) -> bool {
             Key::Resize | Key::Click(..) | Key::DoubleClick(..) => continue,
             Key::Scroll(d) => v.step(d as isize),
             _ if k.is_ctrl('s') => {
-                if save(term, bg, u) {
+                if save(term, bg, u, &baseline) {
                     return true;
                 }
                 v.sync(u);
@@ -1078,7 +1083,7 @@ pub fn run(term: &mut Term, bg: Background, u: &mut Unit, title: &str) -> bool {
                 Some(KeyCode::PageDown) => v.pane_top += PANE_SCROLL,
                 Some(KeyCode::Enter) => {
                     if v.current() == Id::Save {
-                        if save(term, bg, u) {
+                        if save(term, bg, u, &baseline) {
                             return true;
                         }
                     } else {
@@ -1152,7 +1157,19 @@ fn preview(term: &mut Term, bg: Background, u: &Unit) {
     dialogs::pager(term, bg, "Preview", &body);
 }
 
-fn save(term: &mut Term, bg: Background, u: &Unit) -> bool {
+/// Read the unit's files as they stand, to compare against at save time.
+fn baseline_of(u: &Unit) -> diff::Baseline {
+    let dir = systemd::unit_dir(u.scope);
+    let paths: Vec<std::path::PathBuf> = u
+        .filenames()
+        .unwrap_or_default()
+        .iter()
+        .map(|f| dir.join(f))
+        .collect();
+    diff::snapshot(paths.iter().map(|p| p.as_path()))
+}
+
+fn save(term: &mut Term, bg: Background, u: &Unit, baseline: &diff::Baseline) -> bool {
     if let Err(e) = u.validate() {
         dialogs::msgbox(term, bg, "Cannot install", &e);
         return false;
@@ -1165,26 +1182,38 @@ fn save(term: &mut Term, bg: Background, u: &Unit) -> bool {
         }
     };
     let dir = systemd::unit_dir(u.scope);
-    let existing: Vec<&String> = files.iter().filter(|f| dir.join(f).exists()).collect();
-    let body = format!(
-        "Write into {}:\n  {}\n{}",
-        dir.display(),
-        files.join("\n  "),
-        if existing.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\nOverwrites: {}\n",
-                existing
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+    let targets: Vec<(std::path::PathBuf, String)> = generate::render(u)
+        .into_iter()
+        .map(|f| (dir.join(&f.name), f.body))
+        .collect();
+    let existing = targets.iter().any(|(p, _)| p.exists());
+
+    if existing {
+        // Editing something that is already installed: show exactly what
+        // would change, and refuse to write without a yes.
+        let diffs = diff::against_disk(baseline, &targets);
+        if !diff::any_change(&diffs) && !diff::any_drift(&diffs) {
+            dialogs::msgbox(
+                term,
+                bg,
+                "Nothing to write",
+                &format!("{} is already exactly what is on disk.", files.join(", ")),
+            );
+            return false;
         }
-    );
-    if !dialogs::confirm(term, bg, "Install", &body) {
-        return false;
+        if !diff::review(
+            term,
+            bg,
+            &format!("Changes to {}", files.join(", ")),
+            &diffs,
+        ) {
+            return false;
+        }
+    } else {
+        let body = format!("Write into {}:\n  {}", dir.display(), files.join("\n  "));
+        if !dialogs::confirm(term, bg, "Install", &body) {
+            return false;
+        }
     }
     let start = !matches!(u.body, Body::Mount(_))
         || dialogs::confirm(term, bg, "Start now", "Mount it immediately as well?");

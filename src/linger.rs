@@ -96,14 +96,6 @@ pub enum Linger {
 }
 
 impl Linger {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Linger::Enabled => "enabled",
-            Linger::Disabled => "disabled",
-            Linger::Unknown => "unknown",
-        }
-    }
-
     /// True only for a definite "no". `Unknown` is not a problem to report.
     pub fn is_definitely_disabled(self) -> bool {
         self == Linger::Disabled
@@ -123,14 +115,6 @@ pub fn state_in(dir: &Path, user: &str) -> Linger {
 /// Lingering state for `user` on this machine.
 pub fn state_for(user: &str) -> Linger {
     state_in(Path::new(LINGER_DIR), user)
-}
-
-/// Lingering state for the current user. An unknown username is `Unknown`.
-pub fn state() -> Linger {
-    match current_user() {
-        Some(u) => state_for(&u),
-        None => Linger::Unknown,
-    }
 }
 
 /// Whether lingering matters at all for a scope. System units are started by
@@ -207,12 +191,6 @@ pub fn enable(user: &str) -> Result<(), String> {
     } else {
         format!("loginctl enable-linger {user}: {msg}")
     })
-}
-
-/// [`enable`] for whoever notcron is running as.
-pub fn enable_current() -> Result<(), String> {
-    let user = current_user().ok_or("cannot enable lingering: unknown username")?;
-    enable(&user)
 }
 
 /// Path of the marker file for a user, for display in a confirmation dialog.

@@ -11,13 +11,9 @@ mod systemd;
 mod ui;
 mod unit;
 
-// Undo-for-remove, the lingering check and unit export. Same story as below:
-// the `allow(dead_code)` goes when the TUI calls into them.
-#[allow(dead_code)]
+// Undo-for-remove, the lingering check and unit export.
 mod export;
-#[allow(dead_code)]
 mod linger;
-#[allow(dead_code)]
 mod trash;
 
 // Pure logic backing the builder's completion, validation and templates.

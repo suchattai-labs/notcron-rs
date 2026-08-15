@@ -292,6 +292,43 @@ mod tests {
         assert_eq!(String::from_utf8(buf).unwrap(), text(&sample()).unwrap());
     }
 
+    /// A sink that behaves like the read end of `| head` after it has exited.
+    struct ClosedPipe;
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `notcron export foo | head` must exit 0. The reader closing early is
+    /// the reader's business, not an export failure.
+    #[test]
+    fn a_broken_pipe_is_success_not_an_error() {
+        assert_eq!(write_text(&sample(), &mut ClosedPipe), Ok(()));
+    }
+
+    /// Any other write failure is still an error, so the broken-pipe rule
+    /// cannot swallow a real one (a full disk when redirected to a file).
+    #[test]
+    fn other_write_failures_are_still_errors() {
+        struct Full;
+        impl Write for Full {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::StorageFull, "no space"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(matches!(
+            write_text(&sample(), &mut Full),
+            Err(ExportError::Io(_))
+        ));
+    }
+
     #[test]
     fn pre_rendered_files_can_be_exported_directly() {
         let tmp = TempDir::new().unwrap();

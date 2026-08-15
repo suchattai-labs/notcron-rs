@@ -1,12 +1,15 @@
-//! The headless command line. Three verbs only -- `list`, `remove` and
-//! `add` -- because the TUI is the primary interface; these exist so notcron
-//! can be driven from a provisioning script.
+//! The headless command line. Four verbs only -- `list`, `remove`, `add` and
+//! `export` -- because the TUI is the primary interface; these exist so
+//! notcron can be driven from a provisioning script.
 
 use crate::cron::{self, Translation};
+use crate::export as exporter;
+use crate::linger;
 use crate::systemd;
 use crate::unit::escape;
 use crate::unit::model::{Body, Schedule, Scope, Unit};
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -37,6 +40,8 @@ pub enum Command {
     Remove(RemoveArgs),
     /// create a timer + service pair from a cron expression
     Add(AddArgs),
+    /// print a unit's files, or write them to a directory
+    Export(ExportArgs),
 }
 
 /// `--user` (the default) or `--system`.
@@ -81,6 +86,20 @@ pub struct ListArgs {
 
 #[derive(Args)]
 pub struct RemoveArgs {
+    /// unit name, with or without the notcron- prefix
+    name: String,
+}
+
+#[derive(Args)]
+pub struct ExportArgs {
+    /// write the files into this directory instead of printing them
+    #[arg(long, value_name = "DIR")]
+    dir: Option<PathBuf>,
+
+    /// overwrite files that already exist in --dir
+    #[arg(long)]
+    force: bool,
+
     /// unit name, with or without the notcron- prefix
     name: String,
 }
@@ -144,7 +163,31 @@ pub fn run(cmd: Command, scope: Scope) -> ExitCode {
         Command::List(a) => list(a, scope),
         Command::Remove(a) => remove(a, scope),
         Command::Add(a) => add(a, scope),
+        Command::Export(a) => export(a, scope),
     }
+}
+
+/// Match a user-typed name against a listing, accepting the bare stem
+/// (`backup`), the prefixed stem (`notcron-backup`) or the full unit name
+/// (`notcron-backup.timer`).
+pub(crate) fn matches_name(e: &systemd::Entry, name: &str) -> bool {
+    let wanted = crate::unit::model::prefixed(name);
+    let stem = e.primary.rsplit_once('.').map(|(s, _)| s);
+    e.primary == name || stem == Some(wanted.as_str()) || stem == Some(name)
+}
+
+/// Find one unit by name, or produce the "no such unit" message.
+fn find(scope: Scope, name: &str) -> Result<systemd::Entry, String> {
+    let entries = systemd::list(scope, true)?;
+    entries
+        .into_iter()
+        .find(|e| matches_name(e, name))
+        .ok_or_else(|| {
+            format!(
+                "no unit named '{name}' in {} scope (try: notcron list)",
+                scope.as_str()
+            )
+        })
 }
 
 fn list(a: ListArgs, scope: Scope) -> ExitCode {
@@ -178,22 +221,9 @@ fn list(a: ListArgs, scope: Scope) -> ExitCode {
 }
 
 fn remove(a: RemoveArgs, scope: Scope) -> ExitCode {
-    let entries = match systemd::list(scope, true) {
+    let hit = match find(scope, &a.name) {
         Ok(e) => e,
         Err(e) => return fail(e),
-    };
-    let wanted = crate::unit::model::prefixed(&a.name);
-    let hit = entries.iter().find(|e| {
-        e.primary == a.name
-            || e.primary.rsplit_once('.').map(|(s, _)| s) == Some(wanted.as_str())
-            || e.primary.rsplit_once('.').map(|(s, _)| s) == Some(a.name.as_str())
-    });
-    let Some(hit) = hit else {
-        return fail(format!(
-            "no unit named '{}' in {} scope (try: notcron list)",
-            a.name,
-            scope.as_str()
-        ));
     };
     if !hit.owned {
         return fail(format!(
@@ -201,10 +231,71 @@ fn remove(a: RemoveArgs, scope: Scope) -> ExitCode {
             hit.primary
         ));
     }
-    match systemd::remove(scope, &hit.files) {
-        Ok(()) => {
+    match systemd::remove_reporting(scope, &hit.files) {
+        Ok(r) => {
             println!("removed {}", hit.files.join(", "));
+            for w in &r.warnings {
+                eprintln!("notcron: warning: {w}");
+            }
+            // The files are not gone, only stashed; say where, and how to
+            // change your mind.
+            if let Some(t) = &r.trashed {
+                println!("kept in the trash as {} (undo from the TUI)", t.id);
+            }
             ExitCode::SUCCESS
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// `notcron export <name>` -- print the unit's files, or write them to a
+/// directory with `--dir`.
+///
+/// Restricted to notcron-owned units, like `remove`: the bytes are re-rendered
+/// from notcron's own model, so exporting a foreign unit would hand back
+/// something subtly different from what is installed. `notcron list --all`
+/// plus `cat` is the honest way to look at those.
+fn export(a: ExportArgs, scope: Scope) -> ExitCode {
+    let hit = match find(scope, &a.name) {
+        Ok(e) => e,
+        Err(e) => return fail(e),
+    };
+    if !hit.owned {
+        return fail(format!(
+            "'{}' was not created by notcron; export re-renders from notcron's \
+             model and would not reproduce it faithfully",
+            hit.primary
+        ));
+    }
+    let Some(u) = hit.unit else {
+        return fail(format!(
+            "'{}' could not be modelled by notcron and cannot be exported",
+            hit.primary
+        ));
+    };
+
+    let Some(dir) = a.dir else {
+        // stdout: a broken pipe (`notcron export foo | head`) is success.
+        let mut out = std::io::stdout();
+        return match exporter::write_text(&u, &mut out) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(e),
+        };
+    };
+
+    match exporter::export(&u, &dir, a.force) {
+        Ok(r) => {
+            for p in &r.written {
+                println!("wrote {}", p.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(exporter::ExportError::Exists(paths)) => {
+            let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            fail(format!(
+                "{} already exist(s); nothing was written. Re-run with --force to replace.",
+                names.join(", ")
+            ))
         }
         Err(e) => fail(e),
     }
@@ -307,6 +398,12 @@ fn add(a: AddArgs, scope: Scope) -> ExitCode {
             match u.primary_unit() {
                 Ok(p) => println!("enabled and started {p}"),
                 Err(e) => return fail(e),
+            }
+            // A user timer that outlives no login session is the commonest way
+            // for a freshly added job to silently never run. The TUI prompts;
+            // the CLI has nowhere to prompt from, so it warns and moves on.
+            if let Some(w) = linger::check(scope).warning() {
+                eprintln!("notcron: warning: {w}");
             }
             ExitCode::SUCCESS
         }
@@ -495,5 +592,118 @@ mod tests {
         let cli = Cli::try_parse_from(["notcron"]).unwrap();
         assert!(cli.command.is_none());
         assert!(!cli.self_check);
+    }
+
+    // -----------------------------------------------------------------
+    // export
+    // -----------------------------------------------------------------
+
+    fn export_args(argv: &[&str]) -> ExportArgs {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Command::Export(a)) => a,
+            _ => panic!("expected export in {argv:?}"),
+        }
+    }
+
+    #[test]
+    fn export_defaults_to_stdout_and_refuses_to_clobber() {
+        let a = export_args(&["notcron", "export", "backup"]);
+        assert_eq!(a.name, "backup");
+        assert!(a.dir.is_none(), "no --dir means print to stdout");
+        assert!(!a.force, "overwriting must be opt-in");
+    }
+
+    #[test]
+    fn export_takes_a_directory_and_a_force_flag() {
+        let a = export_args(&[
+            "notcron", "export", "--dir", "/tmp/out", "--force", "backup",
+        ]);
+        assert_eq!(a.dir, Some(PathBuf::from("/tmp/out")));
+        assert!(a.force);
+        assert_eq!(a.name, "backup");
+    }
+
+    /// `--user`/`--system` are global, so they work on export from either
+    /// side, exactly as they do on list and remove.
+    #[test]
+    fn export_honours_the_global_scope_flags() {
+        assert_eq!(
+            scope_of(&["notcron", "--system", "export", "backup"]),
+            Scope::System
+        );
+        assert_eq!(
+            scope_of(&["notcron", "export", "backup", "--system"]),
+            Scope::System
+        );
+        assert_eq!(scope_of(&["notcron", "export", "backup"]), Scope::User);
+    }
+
+    #[test]
+    fn export_needs_a_unit_name() {
+        assert!(Cli::try_parse_from(["notcron", "export"]).is_err());
+    }
+
+    /// The lookup `export` and `remove` share: a user may type the bare stem,
+    /// the prefixed stem or the full unit name.
+    #[test]
+    fn a_unit_is_found_by_bare_prefixed_or_full_name() {
+        let e = systemd::Entry {
+            primary: "notcron-backup.timer".into(),
+            files: vec!["notcron-backup.timer".into()],
+            scope: Scope::User,
+            owned: true,
+            description: String::new(),
+            kind: "timer",
+            schedule: String::new(),
+            unit: None,
+            active: String::new(),
+            enabled: String::new(),
+        };
+        for name in ["backup", "notcron-backup", "notcron-backup.timer"] {
+            assert!(matches_name(&e, name), "{name} should match");
+        }
+        for name in ["backu", "backup.timer", "other"] {
+            assert!(!matches_name(&e, name), "{name} should not match");
+        }
+    }
+
+    /// The CLI's own promise on top of `export::export`: a refused overwrite
+    /// names every offending file and leaves all of them untouched.
+    #[test]
+    fn exporting_over_existing_files_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("out");
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "backup".into();
+        u.description = "backup".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.schedule = Schedule::Calendar(vec!["*-*-* 03:00:00".into()]);
+            t.service.exec_start = "/bin/true".into();
+        }
+
+        // A clean export first, so we know what the file names are.
+        let first = exporter::export(&u, &dir, false).unwrap();
+        assert!(first.written.len() >= 2, "{:?}", first.written);
+        for p in &first.written {
+            std::fs::write(p, "PRE-EXISTING\n").unwrap();
+        }
+
+        match exporter::export(&u, &dir, false) {
+            Err(exporter::ExportError::Exists(paths)) => {
+                assert_eq!(paths.len(), first.written.len());
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // Every file still holds what it held before the refused export.
+        for p in &first.written {
+            assert_eq!(std::fs::read_to_string(p).unwrap(), "PRE-EXISTING\n");
+        }
+
+        // --force is the documented way through.
+        let forced = exporter::export(&u, &dir, true).unwrap();
+        assert_eq!(forced.replaced.len(), first.written.len());
+        for p in &forced.written {
+            assert_ne!(std::fs::read_to_string(p).unwrap(), "PRE-EXISTING\n");
+        }
     }
 }
