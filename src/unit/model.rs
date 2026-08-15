@@ -266,6 +266,13 @@ impl MountPreset {
             MountPreset::Bind => "/source/directory",
         }
     }
+
+    /// Whether `What=` names something on this filesystem. It does for block
+    /// devices and bind mounts; NFS and CIFS take `server:/export` and
+    /// `//server/share`, which are not paths and must be typed.
+    pub fn what_is_path(self) -> bool {
+        matches!(self, MountPreset::Block | MountPreset::Bind)
+    }
 }
 
 /// A `.mount` unit, optionally paired with an `.automount`.

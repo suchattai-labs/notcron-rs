@@ -103,7 +103,43 @@ scope.
 | `q`, `Esc` | quit | | |
 
 Inside a builder form: `Enter` edits the selected field, `Tab`/arrows move,
-`p` previews the generated files, `Ctrl-S` saves, `Esc` cancels.
+`b` browses the filesystem for the selected path field, `p` previews the
+generated files, `Ctrl-S` saves, `Esc` cancels.
+
+### Browsing for paths
+
+Every field that holds a path takes `b`, which opens a filesystem picker
+instead of making you type it. Typing still works exactly as before — the
+picker is an alternative, never a requirement.
+
+| field | picks | filled in as |
+|---|---|---|
+| `ExecStart` | a file | the program, arguments preserved |
+| `ExecStartPre`, `ExecStopPost` | a file | the program, arguments preserved |
+| `WorkingDirectory` | a directory | the whole value |
+| mount `Where` | a directory | the whole value, unit name re-derived |
+| mount `What` | a file or directory | the whole value |
+
+`What` only offers the picker for block-device and bind mounts. For NFS and
+CIFS it holds `server:/export` or `//server/share`, which are not local paths,
+so `b` is inert there and you type them as usual.
+
+The picker opens on the field's current value — the directory itself, or the
+parent of a file, or the nearest ancestor that exists — falling back to `$HOME`
+and then `/`.
+
+| key | action | key | action |
+|---|---|---|---|
+| `↑`/`↓`, `k`/`j` | move | `Enter`, `→`, `l` | descend, or select |
+| `Home` / `End` | first / last | `←`, `Backspace`, `h` | parent directory |
+| `PgUp` / `PgDn` | page | `H` | show/hide dotfiles |
+| `Esc` | cancel, leaving the field alone | `Ctrl-S` | take the current directory |
+
+Directories sort before files, carry a trailing `/`, and a `[ use this
+directory ]` row at the top confirms wherever you are — so a field wanting a
+directory never makes you descend into a file to get out. Fields wanting a
+file do not list that row. A directory you cannot read reports why in the
+status line and leaves you where you were.
 
 `n` offers three builders.
 

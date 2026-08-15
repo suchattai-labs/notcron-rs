@@ -4,6 +4,7 @@
 
 use super::dialogs::{self, Background};
 use super::editor;
+use super::picker;
 use super::term::Term;
 use crate::cron::{self, Translation};
 use crate::systemd;
@@ -15,7 +16,7 @@ use crate::unit::model::{
 use crossterm::event::KeyCode;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
 };
 
 /// Identifies what activating a row does.
@@ -263,6 +264,13 @@ pub fn run(term: &mut Term, bg: Background, u: &mut Unit, title: &str) -> bool {
             sel = step(&rows, sel, 1);
         }
         let (t, st) = (title.to_string(), status.clone());
+        // Surface the picker on the row it applies to, so it is discoverable
+        // without reading the help.
+        let (browse, browse_style) = if browsable(u, rows[sel].id).is_some() {
+            ("b browses this path", Style::new().bold().fg(Color::Cyan))
+        } else {
+            ("b browses path fields", Style::new().fg(Color::DarkGray))
+        };
         let s = sel;
         let mut visible = 1usize;
         let painted: Vec<(Id, String, String)> = rows
@@ -273,7 +281,11 @@ pub fn run(term: &mut Term, bg: Background, u: &mut Unit, title: &str) -> bool {
         let _ = term.terminal.draw(|f| {
             bg(f);
             let area = f.area();
-            let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+            // Four lines, not three: the status and the help line each need
+            // one, and at three the status pushed the keybindings off screen
+            // entirely whenever the unit was still incomplete -- which is
+            // always, when the form has just opened.
+            let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(area);
             let block = Block::default()
                 .title(format!(" {t} "))
                 .title_style(Style::new().bold())
@@ -316,12 +328,21 @@ pub fn run(term: &mut Term, bg: Background, u: &mut Unit, title: &str) -> bool {
                 .collect();
             f.render_widget(Paragraph::new(lines), inner);
 
-            let help = "Enter edits   Tab/arrows move   p previews   Ctrl-S saves   Esc cancels";
+            // Status and help get a line each and are truncated rather than
+            // wrapped, so neither can ever push the other off the screen.
+            let footer = Block::default().borders(Borders::ALL);
+            let fi = footer.inner(chunks[1]);
+            f.render_widget(footer, chunks[1]);
+            let fr = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(fi);
+            f.render_widget(Paragraph::new(st.as_str()), fr[0]);
             f.render_widget(
-                Paragraph::new(format!("{st}\n{help}"))
-                    .wrap(Wrap { trim: true })
-                    .block(Block::default().borders(Borders::ALL)),
-                chunks[1],
+                Paragraph::new(Line::from(vec![
+                    Span::raw("Enter edits   Tab/arrows move   "),
+                    Span::styled(browse, browse_style),
+                    Span::raw("   p previews   Ctrl-S saves   Esc cancels"),
+                ]))
+                .style(Style::new().fg(Color::DarkGray)),
+                fr[1],
             );
         });
         if sel < top {
@@ -360,6 +381,16 @@ pub fn run(term: &mut Term, bg: Background, u: &mut Unit, title: &str) -> bool {
                         activate(term, bg, u, rows[sel].id);
                     }
                     status = status_line(u);
+                }
+                _ if k.is_char('b') => {
+                    if browsable(u, rows[sel].id).is_some() {
+                        browse_field(term, bg, u, rows[sel].id);
+                        status = status_line(u);
+                    } else {
+                        status = "b browses only path fields: ExecStart, ExecStartPre, \
+                                  ExecStopPost, WorkingDirectory, What and Where"
+                            .into();
+                    }
                 }
                 _ if k.is_char('p') => preview(term, bg, u),
                 _ if k.is_char('k') => sel = step(&rows, sel, -1),
@@ -784,6 +815,107 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Filesystem picker
+// ---------------------------------------------------------------------------
+
+/// How a picked path lands in the field it was picked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// Replaces the whole value.
+    Whole,
+    /// Replaces the program of a command line, keeping its arguments.
+    Program,
+}
+
+/// What `b` browses for on this row, if the row holds a path at all.
+fn browsable(u: &Unit, id: Id) -> Option<(&'static str, picker::Mode, Fill)> {
+    match id {
+        Id::ExecStart => Some(("ExecStart", picker::Mode::File, Fill::Program)),
+        Id::ExecStartPre => Some(("ExecStartPre", picker::Mode::File, Fill::Program)),
+        Id::ExecStopPost => Some(("ExecStopPost", picker::Mode::File, Fill::Program)),
+        Id::WorkDir => Some(("WorkingDirectory", picker::Mode::Directory, Fill::Whole)),
+        Id::Where => Some(("Where", picker::Mode::Directory, Fill::Whole)),
+        // `What=` is only a local path for block devices and bind mounts. For
+        // NFS and CIFS it is `server:/export` or `//server/share`, which no
+        // picker can produce, so browsing is not offered there at all and
+        // typing stays the only -- and correct -- route.
+        Id::What => match &u.body {
+            Body::Mount(m) if m.preset.what_is_path() => {
+                Some(("What", picker::Mode::Any, Fill::Whole))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The current value of a browsable field.
+fn path_field(u: &Unit, id: Id) -> String {
+    let svc = match &u.body {
+        Body::Timer(t) => Some(&t.service),
+        Body::Service(s) => Some(&s.service),
+        Body::Mount(_) => None,
+    };
+    match (id, svc, &u.body) {
+        (Id::ExecStart, Some(s), _) => s.exec_start.clone(),
+        (Id::ExecStartPre, Some(s), _) => opt_or_empty(&s.exec_start_pre),
+        (Id::ExecStopPost, Some(s), _) => opt_or_empty(&s.exec_stop_post),
+        (Id::WorkDir, Some(s), _) => opt_or_empty(&s.working_directory),
+        (Id::What, _, Body::Mount(m)) => m.what.clone(),
+        (Id::Where, _, Body::Mount(m)) => m.where_.clone(),
+        _ => String::new(),
+    }
+}
+
+fn opt_or_empty(v: &Option<String>) -> String {
+    v.clone().unwrap_or_default()
+}
+
+fn set_path_field(u: &mut Unit, id: Id, v: String) {
+    match id {
+        Id::ExecStart => service_mut(u).exec_start = v,
+        Id::ExecStartPre => service_mut(u).exec_start_pre = Some(v),
+        Id::ExecStopPost => service_mut(u).exec_stop_post = Some(v),
+        Id::WorkDir => service_mut(u).working_directory = Some(v),
+        Id::What => {
+            if let Body::Mount(m) = &mut u.body {
+                m.what = v;
+            }
+        }
+        Id::Where => {
+            if let Body::Mount(m) = &mut u.body {
+                m.where_ = v;
+                // The unit filename is derived from the mount point.
+                u.name = u.stem().unwrap_or_default();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply a picked path to the value a field already held.
+fn fill_value(fill: Fill, current: &str, picked: &str) -> String {
+    match fill {
+        Fill::Whole => picked.to_string(),
+        Fill::Program => picker::join_command(picked, &picker::split_command(current).1),
+    }
+}
+
+/// `b` on a path row: browse for it, then write the result back. Escaping the
+/// picker leaves the field exactly as it was.
+fn browse_field(term: &mut Term, bg: Background, u: &mut Unit, id: Id) -> Option<String> {
+    let (label, mode, fill) = browsable(u, id)?;
+    let current = path_field(u, id);
+    let seed = match fill {
+        Fill::Program => picker::split_command(&current).0,
+        Fill::Whole => current.clone(),
+    };
+    let picked = picker::browse(term, bg, label, mode, &seed)?;
+    set_path_field(u, id, fill_value(fill, &current, &picked));
+    Some(picked)
+}
+
 fn manual_field(u: &Unit, id: Id) -> &str {
     match (&u.body, id) {
         (Body::Timer(t), Id::ManualPrimary) => &t.service_manual,
@@ -1143,6 +1275,124 @@ mod tests {
         assert_eq!(summarize(""), "(none)");
         assert_eq!(summarize("Nice=19"), "Nice=19");
         assert_eq!(summarize("[Service]\nNice=19"), "(2 lines)");
+    }
+
+    #[test]
+    fn every_path_field_is_browsable_with_the_right_mode() {
+        use picker::Mode;
+        let timer = Unit::new_timer(Scope::User);
+        for (id, mode, fill) in [
+            (Id::ExecStart, Mode::File, Fill::Program),
+            (Id::ExecStartPre, Mode::File, Fill::Program),
+            (Id::ExecStopPost, Mode::File, Fill::Program),
+            (Id::WorkDir, Mode::Directory, Fill::Whole),
+        ] {
+            let got = browsable(&timer, id).unwrap_or_else(|| panic!("{id:?} must browse"));
+            assert_eq!((got.1, got.2), (mode, fill), "{id:?}");
+        }
+        // The same service fields on a standalone service, not just a timer.
+        let svc = Unit::new_service(Scope::User);
+        assert!(browsable(&svc, Id::ExecStart).is_some());
+        assert!(browsable(&svc, Id::WorkDir).is_some());
+
+        // A mount's Where is always a directory.
+        let mount = Unit::new_mount();
+        assert_eq!(
+            browsable(&mount, Id::Where).map(|b| b.1),
+            Some(Mode::Directory)
+        );
+    }
+
+    /// Every row the builder can show is either browsable or explicitly not;
+    /// nothing holding a path may be missed.
+    #[test]
+    fn no_path_row_is_left_without_a_picker() {
+        let path_rows = [
+            Id::ExecStart,
+            Id::ExecStartPre,
+            Id::ExecStopPost,
+            Id::WorkDir,
+            Id::What,
+            Id::Where,
+        ];
+        for u in [
+            Unit::new_timer(Scope::User),
+            Unit::new_service(Scope::User),
+            Unit::new_mount(),
+        ] {
+            for r in rows_for(&u) {
+                if path_rows.contains(&r.id) {
+                    continue;
+                }
+                assert!(
+                    browsable(&u, r.id).is_none(),
+                    "{:?} browses unexpectedly",
+                    r.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mount_what_browses_only_when_it_is_a_local_path() {
+        let mut u = Unit::new_mount();
+        for (preset, browses) in [
+            (MountPreset::Block, true),
+            (MountPreset::Bind, true),
+            (MountPreset::Nfs, false),
+            (MountPreset::Cifs, false),
+        ] {
+            if let Body::Mount(m) = &mut u.body {
+                m.preset = preset;
+            }
+            assert_eq!(
+                browsable(&u, Id::What).is_some(),
+                browses,
+                "{}",
+                preset.label()
+            );
+        }
+    }
+
+    #[test]
+    fn picking_a_binary_keeps_the_arguments() {
+        assert_eq!(
+            fill_value(Fill::Program, "/bin/old -a --b c", "/usr/bin/new"),
+            "/usr/bin/new -a --b c"
+        );
+        assert_eq!(
+            fill_value(Fill::Program, "/bin/old", "/bin/new"),
+            "/bin/new"
+        );
+        assert_eq!(fill_value(Fill::Program, "", "/bin/new"), "/bin/new");
+        // A whole-value field ignores whatever was there.
+        assert_eq!(fill_value(Fill::Whole, "/old/dir", "/new/dir"), "/new/dir");
+    }
+
+    #[test]
+    fn path_fields_round_trip_through_the_accessors() {
+        let mut u = Unit::new_timer(Scope::User);
+        for id in [
+            Id::ExecStart,
+            Id::ExecStartPre,
+            Id::ExecStopPost,
+            Id::WorkDir,
+        ] {
+            set_path_field(&mut u, id, "/opt/thing".into());
+            assert_eq!(path_field(&u, id), "/opt/thing", "{id:?}");
+        }
+        let mut m = Unit::new_mount();
+        set_path_field(&mut m, Id::What, "/dev/sdb1".into());
+        assert_eq!(path_field(&m, Id::What), "/dev/sdb1");
+        // Where re-derives the unit name, exactly as typing it does.
+        set_path_field(&mut m, Id::Where, "/mnt/backup".into());
+        assert_eq!(path_field(&m, Id::Where), "/mnt/backup");
+        assert_eq!(m.name, m.stem().expect("stem"));
+        assert!(
+            m.name.contains("mnt"),
+            "name follows the mount point: {}",
+            m.name
+        );
     }
 
     #[test]

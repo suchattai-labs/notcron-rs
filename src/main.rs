@@ -10,6 +10,25 @@ mod systemd;
 mod ui;
 mod unit;
 
+// Undo-for-remove, the lingering check and unit export. Same story as below:
+// the `allow(dead_code)` goes when the TUI calls into them.
+#[allow(dead_code)]
+mod export;
+#[allow(dead_code)]
+mod linger;
+#[allow(dead_code)]
+mod trash;
+
+// Pure logic backing the builder's completion, validation and templates.
+// The `allow(dead_code)` markers hold only until the TUI wires each of these
+// up; drop them as the last call site appears.
+#[allow(dead_code)]
+mod complete;
+#[allow(dead_code)]
+mod templates;
+#[allow(dead_code)]
+mod validate;
+
 use clap::Parser;
 use std::process::ExitCode;
 

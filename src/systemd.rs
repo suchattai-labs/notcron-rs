@@ -188,6 +188,160 @@ pub fn check_timespan(spec: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Next-run preview
+// ---------------------------------------------------------------------------
+
+// Not wired into the TUI yet; drop the allow when the builder calls it.
+#[allow(dead_code)]
+/// One future firing of a calendar spec, as reported by `systemd-analyze`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextRun {
+    /// The elapse in the local timezone, e.g. `Mon 2026-08-17 03:00:00 CEST`.
+    pub local: String,
+    /// The same instant in UTC, e.g. `Mon 2026-08-17 01:00:00 UTC`. Empty if
+    /// systemd did not print it (it omits the line when TZ is already UTC).
+    pub utc: String,
+    /// Relative form, e.g. `1 day 23h left`. Empty if not reported.
+    pub from_now: String,
+}
+
+impl NextRun {
+    /// A lexicographically sortable `YYYY-MM-DD HH:MM:SS` key.
+    ///
+    /// Derived from the UTC line so that specs in different timezones (and
+    /// firings either side of a DST change) still order correctly; falls back
+    /// to the local line when systemd printed no UTC form.
+    pub fn sort_key(&self) -> &str {
+        let src = if self.utc.is_empty() {
+            &self.local
+        } else {
+            &self.utc
+        };
+        // "Mon 2026-08-17 01:00:00 UTC" -> "2026-08-17 01:00:00"
+        let rest = src.split_once(' ').map(|(_, r)| r).unwrap_or(src);
+        rest.rsplit_once(' ').map(|(l, _)| l).unwrap_or(rest)
+    }
+}
+
+// Not wired into the TUI yet; drop the allow when the builder calls it.
+#[allow(dead_code)]
+/// Why a next-run preview could not be produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewError {
+    /// `systemd-analyze` is not installed or could not be executed. The
+    /// caller should degrade gracefully rather than treat this as a mistake
+    /// by the user.
+    Unavailable,
+    /// systemd rejected the spec; the string is its own message.
+    Invalid(String),
+}
+
+impl std::fmt::Display for PreviewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PreviewError::Unavailable => f.write_str("systemd-analyze is not available"),
+            PreviewError::Invalid(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for PreviewError {}
+
+// Not wired into the TUI yet; drop the allow when the builder calls it.
+#[allow(dead_code)]
+/// Pull the elapse list out of `systemd-analyze calendar --iterations=N` output.
+///
+/// The shape parsed is:
+///
+/// ```text
+/// Normalized form: Mon *-*-* 03:00:00
+///     Next elapse: Mon 2026-08-17 03:00:00 CEST
+///        (in UTC): Mon 2026-08-17 01:00:00 UTC
+///        From now: 1 day 23h left
+///    Iteration #2: Mon 2026-08-24 03:00:00 CEST
+///        ...
+/// ```
+///
+/// `Next elapse: never` (a spec that can no longer fire) yields no entries.
+fn parse_iterations(text: &str) -> Vec<NextRun> {
+    let mut runs: Vec<NextRun> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let Some((key, value)) = t.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        let is_elapse = key == "Next elapse" || key.starts_with("Iteration #");
+        if is_elapse {
+            if value.is_empty() || value.eq_ignore_ascii_case("never") {
+                continue;
+            }
+            runs.push(NextRun {
+                local: value.to_string(),
+                utc: String::new(),
+                from_now: String::new(),
+            });
+        } else if key == "(in UTC)" {
+            if let Some(last) = runs.last_mut() {
+                last.utc = value.to_string();
+            }
+        } else if key == "From now" {
+            if let Some(last) = runs.last_mut() {
+                last.from_now = value.to_string();
+            }
+        }
+    }
+    runs
+}
+
+// Not wired into the TUI yet; drop the allow when the builder calls it.
+#[allow(dead_code)]
+/// The next `count` firings of a single `OnCalendar=` spec.
+pub fn next_runs(spec: &str, count: usize) -> Result<Vec<NextRun>, PreviewError> {
+    let n = count.max(1).to_string();
+    let out = Command::new("systemd-analyze")
+        .args(["calendar", &format!("--iterations={n}"), spec])
+        .output()
+        .map_err(|_| PreviewError::Unavailable)?;
+    if !out.status.success() {
+        let msg = combined(&out);
+        return Err(PreviewError::Invalid(if msg.trim().is_empty() {
+            format!("systemd rejected the calendar spec '{spec}'")
+        } else {
+            msg.trim().to_string()
+        }));
+    }
+    Ok(parse_iterations(&String::from_utf8_lossy(&out.stdout)))
+}
+
+// Not wired into the TUI yet; drop the allow when the builder calls it.
+#[allow(dead_code)]
+/// The next `count` firings of a whole schedule.
+///
+/// A timer may carry several `OnCalendar=` lines and systemd fires on their
+/// **union**, so the per-spec results are merged, sorted by absolute time,
+/// deduplicated (two specs can name the same instant) and truncated back to
+/// `count` — which is what the timer will actually do.
+///
+/// Any single invalid spec fails the whole preview, since that is what
+/// systemd will complain about at load time too.
+pub fn next_runs_multi(specs: &[String], count: usize) -> Result<Vec<NextRun>, PreviewError> {
+    let live: Vec<&String> = specs.iter().filter(|s| !s.trim().is_empty()).collect();
+    if live.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut all: Vec<NextRun> = Vec::new();
+    for s in live {
+        all.extend(next_runs(s, count)?);
+    }
+    all.sort_by(|a, b| a.sort_key().cmp(b.sort_key()).then(a.local.cmp(&b.local)));
+    all.dedup_by(|a, b| a.local == b.local);
+    all.truncate(count.max(1));
+    Ok(all)
+}
+
+// ---------------------------------------------------------------------------
 // Installing and removing
 // ---------------------------------------------------------------------------
 
@@ -552,5 +706,138 @@ mod tests {
         assert!(check_timespan("15min").is_ok());
         assert!(check_timespan("90s").is_ok());
         assert!(check_timespan("wibble").is_err());
+    }
+
+    const SAMPLE: &str = "\
+Normalized form: Mon *-*-* 03:00:00
+    Next elapse: Mon 2026-08-17 03:00:00 CEST
+       (in UTC): Mon 2026-08-17 01:00:00 UTC
+       From now: 1 day 23h left
+   Iteration #2: Mon 2026-08-24 03:00:00 CEST
+       (in UTC): Mon 2026-08-24 01:00:00 UTC
+       From now: 1 week 1 day left
+   Iteration #3: Mon 2026-08-31 03:00:00 CEST
+       (in UTC): Mon 2026-08-31 01:00:00 UTC
+       From now: 2 weeks 1 day left
+";
+
+    #[test]
+    fn iteration_output_is_parsed() {
+        let runs = parse_iterations(SAMPLE);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].local, "Mon 2026-08-17 03:00:00 CEST");
+        assert_eq!(runs[0].utc, "Mon 2026-08-17 01:00:00 UTC");
+        assert_eq!(runs[0].from_now, "1 day 23h left");
+        assert_eq!(runs[2].local, "Mon 2026-08-31 03:00:00 CEST");
+        // The "Normalized form:" line must not be mistaken for an elapse.
+        assert!(!runs.iter().any(|r| r.local.contains('*')));
+    }
+
+    #[test]
+    fn sort_key_is_the_utc_instant() {
+        let runs = parse_iterations(SAMPLE);
+        assert_eq!(runs[0].sort_key(), "2026-08-17 01:00:00");
+        // Falls back to the local line when no UTC form was printed.
+        let local_only = NextRun {
+            local: "Mon 2026-08-17 03:00:00 CEST".into(),
+            utc: String::new(),
+            from_now: String::new(),
+        };
+        assert_eq!(local_only.sort_key(), "2026-08-17 03:00:00");
+        let mut keys: Vec<&str> = runs.iter().map(|r| r.sort_key()).collect();
+        let sorted = {
+            let mut k = keys.clone();
+            k.sort_unstable();
+            k
+        };
+        keys.dedup();
+        assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn a_spec_that_never_fires_yields_no_runs() {
+        let text = "Normalized form: 2000-01-01 00:00:00\n    Next elapse: never\n";
+        assert!(parse_iterations(text).is_empty());
+    }
+
+    #[test]
+    fn stray_lines_are_ignored() {
+        assert!(parse_iterations("").is_empty());
+        assert!(parse_iterations("no colons here\nOriginal form: whatever\n").is_empty());
+        // Continuation lines with no elapse before them must not panic.
+        assert!(parse_iterations("       (in UTC): Mon 2026-08-17 01:00:00 UTC\n").is_empty());
+    }
+
+    #[test]
+    fn next_runs_returns_the_requested_count() {
+        if !has_analyze() {
+            eprintln!("skipping: systemd-analyze not available");
+            return;
+        }
+        let runs = next_runs("*-*-* 03:00:00", 5).unwrap();
+        assert_eq!(runs.len(), 5);
+        assert!(runs.iter().all(|r| r.local.contains("03:00:00")));
+        // Strictly increasing.
+        for w in runs.windows(2) {
+            assert!(w[0].sort_key() < w[1].sort_key(), "{:?}", w);
+        }
+    }
+
+    #[test]
+    fn next_runs_reports_an_invalid_spec() {
+        if !has_analyze() {
+            return;
+        }
+        match next_runs("not a calendar spec at all", 3) {
+            Err(PreviewError::Invalid(m)) => assert!(!m.is_empty()),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_calendars_are_merged_and_resorted() {
+        if !has_analyze() {
+            return;
+        }
+        let specs = vec!["*-*-* 03:00:00".to_string(), "*-*-* 15:00:00".to_string()];
+        let runs = next_runs_multi(&specs, 4).unwrap();
+        assert_eq!(runs.len(), 4);
+        for w in runs.windows(2) {
+            assert!(w[0].sort_key() <= w[1].sort_key(), "{:?}", w);
+        }
+        // The union really is both specs, not just the first.
+        assert!(runs.iter().any(|r| r.local.contains("03:00:00")));
+        assert!(runs.iter().any(|r| r.local.contains("15:00:00")));
+    }
+
+    #[test]
+    fn identical_specs_are_deduplicated() {
+        if !has_analyze() {
+            return;
+        }
+        let specs = vec!["*-*-* 03:00:00".to_string(), "*-*-* 03:00:00".to_string()];
+        let runs = next_runs_multi(&specs, 3).unwrap();
+        assert_eq!(runs.len(), 3);
+        for w in runs.windows(2) {
+            assert_ne!(w[0].local, w[1].local);
+        }
+    }
+
+    #[test]
+    fn empty_and_blank_specs_preview_as_nothing() {
+        assert!(next_runs_multi(&[], 5).unwrap().is_empty());
+        assert!(next_runs_multi(&["  ".to_string()], 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_bad_spec_fails_the_whole_preview() {
+        if !has_analyze() {
+            return;
+        }
+        let specs = vec!["*-*-* 03:00:00".to_string(), "nonsense!!".to_string()];
+        assert!(matches!(
+            next_runs_multi(&specs, 3),
+            Err(PreviewError::Invalid(_))
+        ));
     }
 }

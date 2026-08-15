@@ -211,7 +211,7 @@ fn remove(a: RemoveArgs, scope: Scope) -> ExitCode {
 }
 
 /// Build the `ExecStart=` value and a name hint from a command line.
-fn build_exec(command: &[String], force_shell: bool) -> (String, String) {
+pub(crate) fn build_exec(command: &[String], force_shell: bool) -> (String, String) {
     let joined = command.join(" ");
     if force_shell || (command.len() == 1 && escape::needs_shell(&joined)) {
         let hint = joined

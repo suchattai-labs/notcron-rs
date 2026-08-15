@@ -2,6 +2,7 @@ pub mod builder;
 pub mod dialogs;
 pub mod editor;
 pub mod list;
+pub mod picker;
 pub mod term;
 
 use crate::unit::model::Scope;
