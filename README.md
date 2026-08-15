@@ -43,7 +43,8 @@ Installs into `~/.local/bin` (override with `PREFIX=/usr/local/bin`). Needs
 curl or wget and nothing else. Linux x86_64 and aarch64.
 
 Or grab the release asset yourself — `notcron-linux-x86_64` /
-`notcron-linux-aarch64`, static musl builds with no runtime dependencies:
+`notcron-linux-aarch64`, static-pie musl builds with no runtime
+dependencies:
 
 ```sh
 curl -fsSLo ~/.local/bin/notcron \
@@ -59,6 +60,16 @@ cargo build --release                              # ./target/release/notcron
 rustup target add x86_64-unknown-linux-musl        # static
 cargo build --release --target x86_64-unknown-linux-musl
 ```
+
+The aarch64 build is **qemu-verified, not hardware-verified**: every
+release is executed under `qemu-aarch64-static` and its output compared
+byte-for-byte against the x86_64 binary, but no real ARM silicon is
+involved. That does not cover ARM hardware behaviour — memory ordering
+under real concurrency, CPU errata, or page size. qemu-user presents 4K
+pages, so a 16K-page host (Apple silicon, some Ampere and Graviton
+configurations) is untested. Subprocesses are not emulated either, so the
+`systemctl` notcron shells out to under emulation is the host's native
+one.
 
 ## Ownership
 
