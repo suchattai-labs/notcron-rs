@@ -1,0 +1,23 @@
+[package]
+name = "notcron"
+version = "0.1.0"
+edition = "2021"
+description = "systemd timer/service/mount manager with a builder TUI, instead of the crontab"
+license = "MIT"
+repository = "https://github.com/suchattai-labs/notcron-rs"
+
+[[bin]]
+name = "notcron"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true

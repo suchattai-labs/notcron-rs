@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross toolchain
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            sudo apt-get update -q && sudo apt-get install -y musl-tools
+          else
+            cargo install cross --locked
+          fi
+      - name: Build
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            cargo build --release --target "${{ matrix.target }}"
+          else
+            cross build --release --target "${{ matrix.target }}"
+          fi
+      - name: Package
+        run: |
+          arch=$(echo "${{ matrix.target }}" | cut -d- -f1)
+          cp "target/${{ matrix.target }}/release/notcron" "notcron-linux-$arch"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notcron-${{ matrix.target }}
+          path: notcron-linux-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: notcron-linux-*
+          generate_release_notes: true
