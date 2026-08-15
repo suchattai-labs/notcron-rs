@@ -21,13 +21,8 @@ mod linger;
 mod trash;
 
 // Pure logic backing the builder's completion, validation and templates.
-// The `allow(dead_code)` markers hold only until the TUI wires each of these
-// up; drop them as the last call site appears.
-#[allow(dead_code)]
 mod complete;
-#[allow(dead_code)]
 mod templates;
-#[allow(dead_code)]
 mod validate;
 
 use clap::Parser;

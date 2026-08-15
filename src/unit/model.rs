@@ -194,6 +194,7 @@ pub struct ServiceOpts {
     pub restart_sec: Option<String>,
     pub working_directory: Option<String>,
     pub run_as: Option<String>,
+    pub group: Option<String>,
     pub environment: Vec<String>,
 }
 

@@ -29,7 +29,9 @@ impl TemplateId {
         TemplateId::CacheWarmer,
     ];
 
-    /// Stable machine-readable id.
+    /// Stable machine-readable id. No caller yet: it exists so a future
+    /// "remember my last template" setting has something to persist.
+    #[allow(dead_code)]
     pub fn key(self) -> &'static str {
         match self {
             TemplateId::Backup => "backup",
@@ -56,6 +58,8 @@ impl TemplateId {
         }
     }
 
+    /// The inverse of [`TemplateId::key`], and dead for the same reason.
+    #[allow(dead_code)]
     pub fn parse(key: &str) -> Option<TemplateId> {
         TemplateId::ALL.into_iter().find(|t| t.key() == key)
     }
@@ -323,7 +327,12 @@ pub fn clone_unit(src: &Unit, existing: &[String]) -> Unit {
 }
 
 /// A mount unit prefilled from a `What=`, with the preset's defaults and a
-/// suggested mount point. Convenience for the builder's "new mount" flow.
+/// suggested mount point.
+///
+/// Unused: the builder's mount flow opens on an empty form and suggests the
+/// mount point itself once `What=` is typed, which covers the same ground
+/// without a second entry point. Kept for a `notcron mount <device>` verb.
+#[allow(dead_code)]
 pub fn mount_from_what(preset: crate::unit::model::MountPreset, what: &str) -> Unit {
     let m = MountUnit {
         preset,

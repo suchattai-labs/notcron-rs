@@ -116,6 +116,7 @@ fn take_service(entries: &[(String, String, String)], svc: &mut ServiceOpts, lef
             "ExecStopPost" => svc.exec_stop_post = Some(v.clone()),
             "WorkingDirectory" => svc.working_directory = Some(v.clone()),
             "User" => svc.run_as = Some(v.clone()),
+            "Group" => svc.group = Some(v.clone()),
             "Environment" => svc.environment.push(v.clone()),
             "Restart" => match RestartPolicy::parse(v) {
                 Some(r) => svc.restart = r,
@@ -507,5 +508,26 @@ mod tests {
             body: String::new(),
         }];
         assert!(parse(Scope::User, &files).is_err());
+    }
+
+    /// `Group=` is modelled rather than swept into the manual block, so it
+    /// survives an edit in place.
+    #[test]
+    fn group_round_trips_as_a_modelled_directive() {
+        let mut u = timer_fixture();
+        if let Body::Timer(t) = &mut u.body {
+            t.service.run_as = Some("backup".into());
+            t.service.group = Some("backup".into());
+        }
+        assert_lossless(&u);
+        let files = render(&u);
+        let body = &files
+            .iter()
+            .find(|f| f.name.ends_with(".service"))
+            .unwrap()
+            .body;
+        assert!(body.contains("\nGroup=backup\n"), "{body}");
+        // ...and it is not duplicated into the manual block.
+        assert!(!body.contains("notcron:manual"), "{body}");
     }
 }

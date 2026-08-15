@@ -152,8 +152,14 @@ WakeSystem=true
 ### service.user
 **Label:** User
 **Summary:** Run as this user. System scope only — in a user unit it is at best a no-op.
-**Detail:** For system units the default is root and `User=` drops to the named account, initialising its supplementary groups from the user database. In a user unit there is no privilege to switch identity: the only accepted value is the user the manager already runs as, and naming anyone else makes the service fail at start. Since notcron defaults to user scope, treat this field as "switch to system scope first". The account must already exist when the unit starts; `Group=` and `DynamicUser=` belong in the manual block.
+**Detail:** For system units the default is root and `User=` drops to the named account, initialising its supplementary groups from the user database. In a user unit there is no privilege to switch identity: the only accepted value is the user the manager already runs as, and naming anyone else makes the service fail at start. Since notcron defaults to user scope, treat this field as "switch to system scope first". The account must already exist when the unit starts; `DynamicUser=` belongs in the manual block.
 **Examples:** backup, www-data, nobody
+
+### service.group
+**Label:** Group
+**Summary:** Primary group for the process. System scope only, and only meaningful alongside User=.
+**Detail:** Sets the primary group of the process, overriding the one the user database gives `User=`. Supplementary groups still come from the user database unless `SupplementaryGroups=` is set in the manual block, so setting `Group=` alone does not drop the account's other memberships. In a user unit it is as unusable as `User=`: the manager cannot change credentials, so anything but the group it already runs as fails the unit at start. Most jobs need no `Group=` at all — `User=` already picks up that account's primary group.
+**Examples:** backup, www-data, nogroup
 
 ### service.environment
 **Label:** Environment

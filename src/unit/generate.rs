@@ -63,6 +63,7 @@ fn service_section(out: &mut String, s: &ServiceOpts, include_type: bool) {
     kv_opt(out, "ExecStopPost", &s.exec_stop_post);
     kv_opt(out, "WorkingDirectory", &s.working_directory);
     kv_opt(out, "User", &s.run_as);
+    kv_opt(out, "Group", &s.group);
     for e in &s.environment {
         if !e.trim().is_empty() {
             kv(out, "Environment", e);

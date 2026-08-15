@@ -135,6 +135,9 @@ pub fn journal(scope: Scope, unit: &str, lines: usize) -> String {
 }
 
 /// True when `systemd-analyze` can be invoked at all.
+// Only the tests consult this; the UI degrades on the `Unavailable` error
+// instead of asking first, which avoids a second process spawn per preview.
+#[cfg(test)]
 pub fn has_analyze() -> bool {
     Command::new("systemd-analyze")
         .arg("--version")
@@ -191,8 +194,6 @@ pub fn check_timespan(spec: &str) -> Result<(), String> {
 // Next-run preview
 // ---------------------------------------------------------------------------
 
-// Not wired into the TUI yet; drop the allow when the builder calls it.
-#[allow(dead_code)]
 /// One future firing of a calendar spec, as reported by `systemd-analyze`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NextRun {
@@ -223,8 +224,6 @@ impl NextRun {
     }
 }
 
-// Not wired into the TUI yet; drop the allow when the builder calls it.
-#[allow(dead_code)]
 /// Why a next-run preview could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewError {
@@ -247,8 +246,6 @@ impl std::fmt::Display for PreviewError {
 
 impl std::error::Error for PreviewError {}
 
-// Not wired into the TUI yet; drop the allow when the builder calls it.
-#[allow(dead_code)]
 /// Pull the elapse list out of `systemd-analyze calendar --iterations=N` output.
 ///
 /// The shape parsed is:
@@ -295,8 +292,6 @@ fn parse_iterations(text: &str) -> Vec<NextRun> {
     runs
 }
 
-// Not wired into the TUI yet; drop the allow when the builder calls it.
-#[allow(dead_code)]
 /// The next `count` firings of a single `OnCalendar=` spec.
 pub fn next_runs(spec: &str, count: usize) -> Result<Vec<NextRun>, PreviewError> {
     let n = count.max(1).to_string();
@@ -315,8 +310,6 @@ pub fn next_runs(spec: &str, count: usize) -> Result<Vec<NextRun>, PreviewError>
     Ok(parse_iterations(&String::from_utf8_lossy(&out.stdout)))
 }
 
-// Not wired into the TUI yet; drop the allow when the builder calls it.
-#[allow(dead_code)]
 /// The next `count` firings of a whole schedule.
 ///
 /// A timer may carry several `OnCalendar=` lines and systemd fires on their

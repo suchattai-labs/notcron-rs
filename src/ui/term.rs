@@ -44,49 +44,86 @@ impl Term {
         })
     }
 
+    /// Next input event, or `None` if `timeout` elapsed without one.
+    ///
+    /// This is what lets a prompt debounce expensive work: wait a beat for
+    /// the next keystroke and, only when it does not arrive, spend a
+    /// subprocess on a preview. Events the UI ignores (mouse motion, key
+    /// releases) do not reset the clock -- the deadline is absolute, so a
+    /// terminal streaming motion reports cannot hold the preview off forever.
+    /// A dead terminal reads as a timeout here rather than as EOF; quitting
+    /// stays [`Term::next_key`]'s job.
+    pub fn poll_key(&mut self, timeout: Duration) -> Option<Key> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.checked_duration_since(Instant::now())?;
+            match event::poll(left) {
+                Ok(true) => {}
+                _ => return None,
+            }
+            match event::read() {
+                Ok(ev) => {
+                    if let Some(k) = self.classify(ev) {
+                        return Some(k);
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Next input event. Key releases and mouse moves are filtered; left
     /// clicks become `Click`/`DoubleClick` and the wheel becomes `Scroll`.
     /// `None` on EOF or a lost terminal -- callers treat that as quit.
     pub fn next_key(&mut self) -> Option<Key> {
         loop {
             match event::read() {
-                Ok(Event::Key(KeyEvent {
-                    code,
-                    modifiers,
-                    kind,
-                    ..
-                })) if kind != KeyEventKind::Release => {
-                    return Some(Key::Press(code, modifiers));
-                }
-                Ok(Event::Mouse(MouseEvent {
-                    kind, column, row, ..
-                })) => match kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let now = Instant::now();
-                        let double = self.last_click.is_some_and(|(x, y, t)| {
-                            x == column
-                                && y == row
-                                && now.duration_since(t) < Duration::from_millis(400)
-                        });
-                        self.last_click = if double {
-                            None
-                        } else {
-                            Some((column, row, now))
-                        };
-                        return Some(if double {
-                            Key::DoubleClick(column, row)
-                        } else {
-                            Key::Click(column, row)
-                        });
+                Ok(ev) => {
+                    if let Some(k) = self.classify(ev) {
+                        return Some(k);
                     }
-                    MouseEventKind::ScrollUp => return Some(Key::Scroll(-1)),
-                    MouseEventKind::ScrollDown => return Some(Key::Scroll(1)),
-                    _ => continue,
-                },
-                Ok(Event::Resize(..)) => return Some(Key::Resize),
-                Ok(_) => continue,
+                }
                 Err(_) => return None,
             }
+        }
+    }
+
+    /// Map a crossterm event onto a [`Key`], or `None` for one the UI ignores.
+    fn classify(&mut self, ev: Event) -> Option<Key> {
+        match ev {
+            Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind,
+                ..
+            }) if kind != KeyEventKind::Release => Some(Key::Press(code, modifiers)),
+            Event::Mouse(MouseEvent {
+                kind, column, row, ..
+            }) => match kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let now = Instant::now();
+                    let double = self.last_click.is_some_and(|(x, y, t)| {
+                        x == column
+                            && y == row
+                            && now.duration_since(t) < Duration::from_millis(400)
+                    });
+                    self.last_click = if double {
+                        None
+                    } else {
+                        Some((column, row, now))
+                    };
+                    Some(if double {
+                        Key::DoubleClick(column, row)
+                    } else {
+                        Key::Click(column, row)
+                    })
+                }
+                MouseEventKind::ScrollUp => Some(Key::Scroll(-1)),
+                MouseEventKind::ScrollDown => Some(Key::Scroll(1)),
+                _ => None,
+            },
+            Event::Resize(..) => Some(Key::Resize),
+            _ => None,
         }
     }
 }

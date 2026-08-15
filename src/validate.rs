@@ -298,6 +298,15 @@ pub fn check_service(svc: &ServiceOpts, scope: Scope) -> Vec<Diagnostic> {
         }
     }
 
+    if let Some(group) = svc.group.as_deref() {
+        if !group.trim().is_empty() && scope == Scope::User {
+            out.push(Diagnostic::error(format!(
+                "Group={group} is not allowed in a user-scope unit; \
+                 a user manager cannot change credentials — switch the unit to system scope"
+            )));
+        }
+    }
+
     for e in &svc.environment {
         if !e.trim().is_empty() && !e.contains('=') {
             out.push(Diagnostic::error(format!(
@@ -306,6 +315,102 @@ pub fn check_service(svc: &ServiceOpts, scope: Scope) -> Vec<Diagnostic> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Suggested fixes
+// ---------------------------------------------------------------------------
+
+/// A change the UI can apply on one keypress to clear a [`Diagnostic`].
+///
+/// The diagnostics that carry a fix are the two that already did the work of
+/// computing the answer: the bare-command warning resolved the binary against
+/// `$PATH`, and the shell-syntax warning already quoted the replacement line.
+/// Rather than recompute either, [`autofix`] reads them back out of the
+/// message, so the fix offered can never disagree with the text explaining it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fix {
+    /// Swap the program of `field`'s command line for this absolute path,
+    /// keeping the arguments.
+    AbsolutePath { field: String, path: String },
+    /// Replace `field`'s whole value with this shell-wrapped line.
+    ShellWrap { field: String, line: String },
+}
+
+impl Fix {
+    /// The directive the fix applies to, e.g. `ExecStart`.
+    pub fn field(&self) -> &str {
+        match self {
+            Fix::AbsolutePath { field, .. } | Fix::ShellWrap { field, .. } => field,
+        }
+    }
+
+    /// One line describing what pressing the key will do.
+    pub fn label(&self) -> String {
+        match self {
+            Fix::AbsolutePath { field, path } => format!("set {field}= to use '{path}'"),
+            Fix::ShellWrap { field, .. } => format!("wrap {field}= in /bin/sh -c"),
+        }
+    }
+
+    /// The value `field` should take, given what it holds now.
+    pub fn apply(&self, current: &str) -> String {
+        match self {
+            Fix::AbsolutePath { path, .. } => replace_program(current, path),
+            Fix::ShellWrap { line, .. } => line.clone(),
+        }
+    }
+}
+
+/// Swap the first token of a command line, keeping the rest verbatim.
+/// Whitespace inside the remainder is preserved, since it may be quoted.
+fn replace_program(current: &str, path: &str) -> String {
+    let trimmed = current.trim_start();
+    match trimmed.find(char::is_whitespace) {
+        Some(i) => format!("{path}{}", &trimmed[i..]),
+        None => path.to_string(),
+    }
+}
+
+/// The directive a message names, i.e. the `ExecStart` of `ExecStart=: ...`.
+fn message_field(msg: &str) -> Option<&str> {
+    let (field, _) = msg.split_once('=')?;
+    if field.is_empty() || field.contains(char::is_whitespace) {
+        None
+    } else {
+        Some(field)
+    }
+}
+
+/// The value between the first pair of single quotes after `after`.
+fn quoted_after<'a>(msg: &'a str, after: &str) -> Option<&'a str> {
+    let rest = msg.split_once(after)?.1;
+    let rest = rest.strip_prefix('\'')?;
+    rest.split_once('\'').map(|(v, _)| v)
+}
+
+/// The one-keypress fix for a diagnostic, if it has one.
+pub fn autofix(d: &Diagnostic) -> Option<Fix> {
+    let msg = &d.message;
+    let field = message_field(msg)?.to_string();
+    if let Some(path) = quoted_after(msg, "use ") {
+        // Only an absolute path is worth substituting in.
+        if path.starts_with('/') {
+            return Some(Fix::AbsolutePath {
+                field,
+                path: path.to_string(),
+            });
+        }
+        return None;
+    }
+    let line = msg.split_once("wrap it as: ")?.1.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(Fix::ShellWrap {
+        field,
+        line: line.to_string(),
+    })
 }
 
 /// Every advisory check that applies to a unit. Mount units have no command
@@ -601,5 +706,96 @@ mod tests {
         assert_eq!(Diagnostic::warning("hi").to_string(), "warning: hi");
         assert_eq!(Diagnostic::error("bye").to_string(), "error: bye");
         assert!(!has_errors(&[Diagnostic::warning("hi")]));
+    }
+
+    // -----------------------------------------------------------------
+    // Suggested fixes
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_bare_command_warning_yields_an_absolute_path_fix() {
+        let Some(real) = which("true") else {
+            eprintln!("skipping: no 'true' on PATH");
+            return;
+        };
+        let d = check_exec_line("ExecStart", "true --quiet");
+        let fix = autofix(&d[0]).expect("a fix");
+        assert_eq!(
+            fix,
+            Fix::AbsolutePath {
+                field: "ExecStart".into(),
+                path: real.display().to_string(),
+            }
+        );
+        // Applying it swaps the program and keeps the arguments verbatim.
+        assert_eq!(
+            fix.apply("true --quiet 'a b'"),
+            format!("{} --quiet 'a b'", real.display())
+        );
+        assert_eq!(fix.apply("true"), real.display().to_string());
+        assert!(fix.label().contains(&real.display().to_string()));
+        assert_eq!(fix.field(), "ExecStart");
+    }
+
+    #[test]
+    fn the_shell_syntax_warning_yields_a_wrapping_fix() {
+        let d = check_exec_line("ExecStart", "/bin/df -h | /usr/bin/mail me");
+        let warn = d
+            .iter()
+            .find(|x| x.message.contains("wrap it as"))
+            .expect("the shell warning");
+        let fix = autofix(warn).expect("a fix");
+        let Fix::ShellWrap { field, line } = &fix else {
+            panic!("expected a wrap, got {fix:?}");
+        };
+        assert_eq!(field, "ExecStart");
+        assert!(line.starts_with("/bin/sh -c "), "{line}");
+        // The fix replaces the whole value, whatever it held.
+        assert_eq!(fix.apply("anything at all"), *line);
+        assert!(is_shell_wrapped(&fix.apply("")));
+    }
+
+    /// A diagnostic that has no computed answer must not fake one.
+    #[test]
+    fn diagnostics_without_an_answer_offer_no_fix() {
+        for d in [
+            Diagnostic::error("ExecStart=: '/nope' does not exist"),
+            Diagnostic::warning("WorkingDirectory=: '/nope' is not an existing directory"),
+            Diagnostic::error("Environment entry 'BAD' is not KEY=VALUE"),
+            Diagnostic::warning("nothing structured here at all"),
+        ] {
+            assert_eq!(autofix(&d), None, "{d}");
+        }
+        // Not found on $PATH: the message names no replacement, so neither
+        // does the fix.
+        let d = check_exec_line("ExecStart", "definitely-not-on-path-xyzzy");
+        assert_eq!(autofix(&d[0]), None, "{}", d[0]);
+    }
+
+    #[test]
+    fn a_fix_is_offered_for_every_exec_directive() {
+        if which("true").is_none() {
+            eprintln!("skipping: no 'true' on PATH");
+            return;
+        }
+        for field in ["ExecStart", "ExecStartPre", "ExecStopPost"] {
+            let d = check_exec_line(field, "true");
+            let fix = autofix(&d[0]).unwrap_or_else(|| panic!("{field}"));
+            assert_eq!(fix.field(), field);
+        }
+    }
+
+    #[test]
+    fn group_is_refused_in_user_scope_just_as_user_is() {
+        let svc = ServiceOpts {
+            exec_start: "/bin/true".into(),
+            group: Some("backup".into()),
+            ..ServiceOpts::default()
+        };
+        let d = check_service(&svc, Scope::User);
+        assert!(has_errors(&d), "{}", joined(&d));
+        assert!(joined(&d).contains("Group=backup"), "{}", joined(&d));
+        // System scope is fine.
+        assert!(check_service(&svc, Scope::System).is_empty());
     }
 }

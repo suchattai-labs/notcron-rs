@@ -6,23 +6,27 @@ use super::dialogs::{self, Background};
 use super::editor;
 use super::optmenu;
 use super::picker;
-use super::term::Term;
+use super::term::{Key, Term};
+use crate::complete::{self, Accounts, Completion};
 use crate::cron::{self, Translation};
+use crate::fieldhelp;
 use crate::systemd;
+use crate::templates;
 use crate::unit::escape;
 use crate::unit::generate;
 use crate::unit::model::{
     Body, MountPreset, RestartPolicy, Schedule, Scope, ServiceOpts, ServiceType, Unit,
 };
+use crate::validate;
 use crossterm::event::KeyCode;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 /// Identifies what activating a row does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Id {
+pub enum Id {
     /// A non-selectable section heading.
     Heading,
     Name,
@@ -40,6 +44,7 @@ enum Id {
     RestartSec,
     WorkDir,
     RunAs,
+    Group,
     Env,
     WantedBy,
     Preset,
@@ -55,10 +60,10 @@ enum Id {
     Save,
 }
 
-struct Row {
-    id: Id,
-    label: String,
-    value: String,
+pub struct Row {
+    pub id: Id,
+    pub label: String,
+    pub value: String,
 }
 
 fn row(id: Id, label: &str, value: impl Into<String>) -> Row {
@@ -109,6 +114,7 @@ fn service_rows(s: &ServiceOpts, rows: &mut Vec<Row>, with_restart: bool) {
         opt(&s.working_directory),
     ));
     rows.push(row(Id::RunAs, "User", opt(&s.run_as)));
+    rows.push(row(Id::Group, "Group", opt(&s.group)));
     rows.push(row(
         Id::Env,
         "Environment",
@@ -206,33 +212,6 @@ fn summarize(text: &str) -> String {
     }
 }
 
-/// The status line under the form: validation state, and the next elapse for
-/// calendar timers.
-fn status_line(u: &Unit) -> String {
-    if let Err(e) = u.validate() {
-        return format!("! {e}");
-    }
-    if !systemd::has_analyze() {
-        return "ready to install (systemd-analyze missing: schedules unchecked)".into();
-    }
-    if let Body::Timer(t) = &u.body {
-        if let Schedule::Calendar(specs) = &t.schedule {
-            let mut parts = Vec::new();
-            for s in specs {
-                match systemd::check_calendar(s) {
-                    Ok(Some(next)) => parts.push(format!("next: {next}")),
-                    Ok(None) => {}
-                    Err(e) => return format!("! {}", e.lines().next().unwrap_or("invalid")),
-                }
-            }
-            if !parts.is_empty() {
-                return parts.join("   ");
-            }
-        }
-    }
-    "ready to install".into()
-}
-
 fn first_selectable(rows: &[Row]) -> usize {
     rows.iter().position(|r| r.id != Id::Heading).unwrap_or(0)
 }
@@ -252,118 +231,840 @@ fn step(rows: &[Row], from: usize, delta: isize) -> usize {
     from
 }
 
+// ---------------------------------------------------------------------------
+// The side pane
+// ---------------------------------------------------------------------------
+
+/// What the pane beside the form is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Off,
+    /// The help document's entry for the focused row.
+    Help,
+    /// The generated unit files, re-rendered on every edit.
+    Preview,
+    /// The next five firings of the schedule.
+    Runs,
+    /// The advisory checks. Never blocks a save.
+    Checks,
+}
+
+impl Pane {
+    /// The order `v` walks, ending at `Off` so the key is also the way out.
+    pub const CYCLE: [Pane; 5] = [
+        Pane::Help,
+        Pane::Preview,
+        Pane::Runs,
+        Pane::Checks,
+        Pane::Off,
+    ];
+
+    pub fn next(self) -> Pane {
+        let i = Pane::CYCLE.iter().position(|p| *p == self).unwrap_or(0);
+        Pane::CYCLE[(i + 1) % Pane::CYCLE.len()]
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Pane::Off => "",
+            Pane::Help => "Field help",
+            Pane::Preview => "Unit files",
+            Pane::Runs => "Next runs",
+            Pane::Checks => "Checks",
+        }
+    }
+}
+
+/// Columns the form keeps for itself before a pane may take any. Below this
+/// the value column stops showing enough of a path to be worth reading.
+const FORM_MIN: u16 = 46;
+/// A pane narrower than this is not worth the space it costs the form.
+const PANE_MIN: u16 = 26;
+const PANE_MAX: u16 = 48;
+
+/// The width at or above which the pane is on when the builder opens.
+///
+/// A permanent split does not fit 80x24: the form needs 46 columns to show a
+/// path next to a 22-column label, which leaves 32 for a pane that wants to
+/// display unit-file lines. So the split is the default only on a terminal
+/// with room for both, and everywhere else it is one keypress (`v`) away.
+const PANE_DEFAULT_WIDTH: u16 = 100;
+
+pub fn default_pane(width: u16) -> Pane {
+    if width >= PANE_DEFAULT_WIDTH {
+        Pane::Help
+    } else {
+        Pane::Off
+    }
+}
+
+/// Split the builder's area into the form and, if it fits, the side pane.
+///
+/// Returns `(form, None)` whenever the pane is off or the terminal is too
+/// narrow to carry one -- the form is never squeezed to make room.
+pub fn split_panes(area: Rect, pane_on: bool) -> (Rect, Option<Rect>) {
+    if !pane_on || area.height < 3 || area.width < FORM_MIN + PANE_MIN {
+        return (area, None);
+    }
+    let want = (area.width * 2 / 5).clamp(PANE_MIN, PANE_MAX);
+    let w = want.min(area.width - FORM_MIN);
+    if w < PANE_MIN {
+        return (area, None);
+    }
+    let form = Rect {
+        width: area.width - w,
+        ..area
+    };
+    let pane = Rect {
+        x: area.x + (area.width - w),
+        width: w,
+        ..area
+    };
+    (form, Some(pane))
+}
+
+// ---------------------------------------------------------------------------
+// Derived state
+// ---------------------------------------------------------------------------
+
+/// The next-run preview's outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runs {
+    /// This schedule has no `OnCalendar=` to analyse -- an interval or boot
+    /// timer, or a body that is not a timer at all. Not an error.
+    NotCalendar(String),
+    /// `systemd-analyze` is missing. Also not an error: the user has done
+    /// nothing wrong and must not be told they have.
+    Unavailable,
+    /// systemd rejected the spec.
+    Invalid(String),
+    Times(Vec<systemd::NextRun>),
+}
+
+/// How many firings the preview shows.
+pub const RUNS_SHOWN: usize = 5;
+
+/// Everything computed *from* the unit rather than typed into it.
+///
+/// Recomputed on a change rather than on a keystroke: the rendered files are
+/// their own fingerprint, so an edit that changes nothing costs nothing, and
+/// the calendar preview -- which shells out -- only reruns when the schedule's
+/// specs actually differ.
+pub struct Derived {
+    pub preview: String,
+    pub diags: Vec<validate::Diagnostic>,
+    pub runs: Runs,
+    runs_key: Option<Vec<String>>,
+    computed: bool,
+}
+
+/// The calendar specs a unit's schedule would be analysed from, if any.
+fn calendar_specs(u: &Unit) -> Option<Vec<String>> {
+    let Body::Timer(t) = &u.body else { return None };
+    match &t.schedule {
+        Schedule::Calendar(specs) if specs.iter().any(|s| !s.trim().is_empty()) => {
+            Some(specs.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Why there is nothing to analyse, in the user's terms.
+fn no_calendar_reason(u: &Unit) -> String {
+    match &u.body {
+        Body::Timer(t) => match &t.schedule {
+            Schedule::Every { every, boot } => format!(
+                "Every {every}, starting {boot} after boot.\n\nAn interval timer has no calendar \
+                 to analyse: when it fires depends on when the machine came up."
+            ),
+            Schedule::Boot { boot } => format!(
+                "At boot + {boot}.\n\nA boot timer has no calendar to analyse: it fires once, \
+                 relative to startup."
+            ),
+            Schedule::Calendar(_) => "No OnCalendar= set yet.".to_string(),
+        },
+        Body::Service(_) => "A standalone service has no schedule; it is started by its \
+                             target or by hand."
+            .to_string(),
+        Body::Mount(_) => "A mount unit has no schedule.".to_string(),
+    }
+}
+
+impl Derived {
+    pub fn new(u: &Unit) -> Derived {
+        let mut d = Derived {
+            preview: String::new(),
+            diags: Vec::new(),
+            runs: Runs::NotCalendar(String::new()),
+            runs_key: None,
+            computed: false,
+        };
+        d.refresh(u);
+        d
+    }
+
+    /// Bring everything in line with `u`, doing no work where nothing moved.
+    pub fn refresh(&mut self, u: &Unit) {
+        let text = generate::preview(u, &systemd::unit_dir(u.scope).to_string_lossy());
+        if !self.computed || text != self.preview {
+            self.preview = text;
+            // Advisory only: `Unit::validate` remains the gate on saving and
+            // this never blocks anything.
+            self.diags = validate::check_unit(u);
+        }
+        let specs = calendar_specs(u);
+        if !self.computed || specs != self.runs_key {
+            self.runs = match &specs {
+                None => Runs::NotCalendar(no_calendar_reason(u)),
+                Some(s) => match systemd::next_runs_multi(s, RUNS_SHOWN) {
+                    Ok(v) => Runs::Times(v),
+                    // A missing systemd-analyze is a fact about the host, not
+                    // a mistake by the user.
+                    Err(systemd::PreviewError::Unavailable) => Runs::Unavailable,
+                    Err(systemd::PreviewError::Invalid(m)) => Runs::Invalid(m),
+                },
+            };
+            self.runs_key = specs;
+        }
+        self.computed = true;
+    }
+
+    /// Diagnostics that carry a one-key fix, worst first.
+    pub fn fixable(&self) -> Vec<&validate::Diagnostic> {
+        self.diags
+            .iter()
+            .filter(|d| validate::autofix(d).is_some())
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// Hard-wrap `text` at `width`, keeping blank lines as paragraph breaks.
+pub fn wrap_lines(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        if para.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            // A word longer than the pane is cut rather than allowed to
+            // overflow the block and corrupt the frame.
+            if word.chars().count() > width {
+                line.extend(word.chars().take(width));
+                out.push(std::mem::take(&mut line));
+            } else {
+                line.push_str(word);
+            }
+        }
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// The help document's entry for a row, as pane lines.
+fn help_lines(id: Id, width: usize) -> Vec<String> {
+    let Some(e) = help_key(id).and_then(fieldhelp::entry) else {
+        return vec!["(no help for this row)".into()];
+    };
+    let mut out = wrap_lines(&e.label, width);
+    out.push(String::new());
+    out.extend(wrap_lines(&e.summary, width));
+    out.push(String::new());
+    out.extend(wrap_lines(&e.detail, width));
+    if !e.examples.is_empty() {
+        out.push(String::new());
+        out.extend(wrap_lines(&format!("Examples: {}", e.examples), width));
+    }
+    out
+}
+
+/// The next-run list, as lines. Shared by the pane and by the live note under
+/// the OnCalendar prompt, so the two can never disagree.
+pub fn runs_lines(runs: &Runs, width: usize) -> Vec<String> {
+    match runs {
+        Runs::NotCalendar(why) => wrap_lines(why, width),
+        Runs::Unavailable => wrap_lines(
+            "Preview unavailable: systemd-analyze is not installed. The schedule itself is fine.",
+            width,
+        ),
+        Runs::Invalid(m) => {
+            let mut out = vec!["! systemd rejected this spec:".to_string(), String::new()];
+            out.extend(wrap_lines(m, width));
+            out
+        }
+        Runs::Times(v) if v.is_empty() => wrap_lines(
+            "This spec has no future elapse -- it will never fire again.",
+            width,
+        ),
+        Runs::Times(v) => {
+            let mut out = Vec::new();
+            for (i, r) in v.iter().enumerate() {
+                out.extend(wrap_lines(&format!("{}. {}", i + 1, r.local), width));
+                if !r.from_now.is_empty() {
+                    out.extend(wrap_lines(&format!("   {}", r.from_now), width));
+                }
+            }
+            out
+        }
+    }
+}
+
+/// The advisory checks, as lines.
+fn check_lines(d: &Derived, width: usize) -> Vec<String> {
+    if d.diags.is_empty() {
+        return wrap_lines(
+            "No advisories.\n\nThese checks are advice, never a gate: anything here can still \
+             be saved.",
+            width,
+        );
+    }
+    let mut out = Vec::new();
+    for diag in &d.diags {
+        out.extend(wrap_lines(
+            &format!("{}: {}", diag.level.as_str(), diag.message),
+            width,
+        ));
+        if let Some(fix) = validate::autofix(diag) {
+            out.extend(wrap_lines(
+                &format!("  -> c, then f: {}", fix.label()),
+                width,
+            ));
+        }
+        out.push(String::new());
+    }
+    out.extend(wrap_lines(
+        "Advice only -- none of this blocks a save.",
+        width,
+    ));
+    out
+}
+
+/// Everything the pane shows, already wrapped to `width`.
+pub fn pane_body(pane: Pane, id: Id, d: &Derived, width: usize) -> Vec<String> {
+    match pane {
+        Pane::Off => Vec::new(),
+        Pane::Help => help_lines(id, width),
+        // Unit files are code: clipped, never re-wrapped.
+        Pane::Preview => d
+            .preview
+            .lines()
+            .map(|l| l.chars().take(width).collect())
+            .collect(),
+        Pane::Runs => runs_lines(&d.runs, width),
+        Pane::Checks => check_lines(d, width),
+    }
+}
+
+/// The whole builder screen, kept apart from the event loop so it can be
+/// rendered at any terminal size in a test.
+pub struct View {
+    pub title: String,
+    pub rows: Vec<Row>,
+    pub sel: usize,
+    pub top: usize,
+    pub pane: Pane,
+    pub pane_top: usize,
+    pub status: String,
+    /// A one-shot message that outranks the status line until the next key.
+    pub flash: Option<String>,
+    pub browsable: bool,
+    pub derived: Derived,
+}
+
+impl View {
+    pub fn new(u: &Unit, title: &str, pane: Pane) -> View {
+        let rows = rows_for(u);
+        let sel = first_selectable(&rows);
+        let mut v = View {
+            title: title.to_string(),
+            rows,
+            sel,
+            top: 0,
+            pane,
+            pane_top: 0,
+            status: String::new(),
+            flash: None,
+            browsable: false,
+            derived: Derived::new(u),
+        };
+        v.sync(u);
+        v
+    }
+
+    /// Rebuild everything that follows from the unit after an edit.
+    pub fn sync(&mut self, u: &Unit) {
+        self.rows = rows_for(u);
+        self.sel = self.sel.min(self.rows.len().saturating_sub(1));
+        if self.rows.get(self.sel).map(|r| r.id) == Some(Id::Heading) {
+            self.sel = step(&self.rows, self.sel, 1);
+        }
+        self.derived.refresh(u);
+        self.refocus(u);
+    }
+
+    /// Everything that depends on *which row is focused* rather than on the
+    /// unit's contents. Cheap, and run every frame: moving the selection has
+    /// to move the picker hint and the status line with it.
+    pub fn refocus(&mut self, u: &Unit) {
+        self.browsable = browsable(u, self.current()).is_some();
+        self.status = status_line(u, &self.derived, self.current());
+    }
+
+    pub fn current(&self) -> Id {
+        self.rows.get(self.sel).map(|r| r.id).unwrap_or(Id::Heading)
+    }
+
+    pub fn step(&mut self, delta: isize) {
+        self.sel = step(&self.rows, self.sel, delta);
+        self.pane_top = 0;
+    }
+}
+
+/// Paint one frame.
+pub fn draw(f: &mut Frame, v: &mut View) {
+    let area = f.area();
+    // The builder covers the screen it was opened from. Without this, a
+    // heading row -- which is a few characters long -- leaves the rest of its
+    // line showing whatever the list had painted there.
+    f.render_widget(Clear, area);
+    // Four lines, not three: the status and the help line each need one, and
+    // at three the status pushed the keybindings off screen entirely whenever
+    // the unit was still incomplete -- which is always, when the form has
+    // just opened.
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(area);
+    let (form_area, pane_area) = split_panes(chunks[0], v.pane != Pane::Off);
+
+    let block = Block::default()
+        .title(format!(" {} ", v.title))
+        .title_style(Style::new().bold())
+        .borders(Borders::ALL);
+    let inner = block.inner(form_area);
+    f.render_widget(block, form_area);
+
+    let visible = inner.height.max(1) as usize;
+    if v.sel < v.top {
+        v.top = v.sel;
+    } else if v.sel >= v.top + visible {
+        v.top = v.sel + 1 - visible;
+    }
+    let label_w = 22usize;
+    let value_w = (inner.width as usize).saturating_sub(label_w + 4);
+    let lines: Vec<Line> = v
+        .rows
+        .iter()
+        .enumerate()
+        .skip(v.top)
+        .take(visible)
+        .map(|(i, r)| {
+            if r.id == Id::Heading {
+                return Line::from(Span::styled(
+                    format!(" {}", r.label),
+                    Style::new().bold().fg(Color::Cyan),
+                ));
+            }
+            let value = truncate(&r.value, value_w);
+            let label = &r.label;
+            let text = format!(
+                " {} {label:<label_w$} {value}",
+                if i == v.sel { ">" } else { " " }
+            );
+            Line::from(Span::styled(
+                truncate(&text, inner.width as usize),
+                if i == v.sel {
+                    Style::new().bold().reversed()
+                } else {
+                    Style::new()
+                },
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+
+    if let Some(rect) = pane_area {
+        draw_pane(f, v, rect);
+    }
+
+    // Status and help get a line each and are truncated rather than wrapped,
+    // so neither can ever push the other off the screen.
+    let footer = Block::default().borders(Borders::ALL);
+    let fi = footer.inner(chunks[1]);
+    f.render_widget(footer, chunks[1]);
+    let fr = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(fi);
+    let status = v.flash.as_deref().unwrap_or(&v.status);
+    f.render_widget(Paragraph::new(truncate(status, fi.width as usize)), fr[0]);
+    let (browse, browse_style) = if v.browsable {
+        ("b browses this path", Style::new().bold().fg(Color::Cyan))
+    } else {
+        ("b browses paths", Style::new().fg(Color::DarkGray))
+    };
+    let mut spans: Vec<Span> = Vec::new();
+    for hint in key_hints(browse, fi.width as usize) {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        let style = if hint == browse {
+            browse_style
+        } else {
+            Style::new().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(hint, style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), fr[1]);
+}
+
+/// The keybinding line, as separate hints.
+///
+/// Too narrow to show them all and the least important are dropped whole,
+/// rather than the line being clipped mid-word -- which is how "Esc cancel"
+/// used to disappear on an 80-column terminal, leaving no visible way out.
+pub fn key_hints(browse: &str, width: usize) -> Vec<String> {
+    let mut parts: Vec<String> = [
+        "Enter edit",
+        "Tab move",
+        browse,
+        "v pane",
+        "? help",
+        "^S save",
+        "Esc cancel",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // Two spaces between hints, none after the last.
+    let used = |p: &[String]| {
+        p.iter().map(|x| x.chars().count()).sum::<usize>() + 2 * p.len().saturating_sub(1)
+    };
+    // In drop order. `b` is not among them: it is the least guessable key
+    // here, and only the focused row advertises it.
+    for hint in ["? help", "v pane", browse, "Tab move"] {
+        if used(&parts) <= width {
+            break;
+        }
+        parts.retain(|p| p != hint);
+    }
+    parts
+}
+
+fn draw_pane(f: &mut Frame, v: &mut View, rect: Rect) {
+    let block = Block::default()
+        .title(format!(" {} ", v.pane.title()))
+        .title_style(Style::new().bold())
+        .borders(Borders::ALL);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let body = pane_body(v.pane, v.current(), &v.derived, inner.width as usize);
+    let height = inner.height as usize;
+    v.pane_top = v.pane_top.min(body.len().saturating_sub(1));
+    let style = match v.pane {
+        Pane::Checks if !v.derived.diags.is_empty() => Style::new().fg(Color::Yellow),
+        Pane::Preview => Style::new().fg(Color::Gray),
+        _ => Style::new(),
+    };
+    let lines: Vec<Line> = body
+        .into_iter()
+        .skip(v.pane_top)
+        .take(height)
+        .map(|l| Line::from(Span::styled(l, style)))
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Help keys
+// ---------------------------------------------------------------------------
+
+/// The `docs/field-help.md` entry backing a row.
+///
+/// Every selectable row has one, and a test asserts it -- the document is the
+/// only copy of this text, so a row without a key is a row whose help silently
+/// disappeared.
+pub fn help_key(id: Id) -> Option<&'static str> {
+    Some(match id {
+        Id::Heading => return None,
+        Id::Name => "unit.name",
+        Id::Description => "unit.description",
+        Id::Scope => "unit.scope",
+        Id::Schedule => "timer.schedule",
+        Id::Persistent => "timer.persistent",
+        Id::RandomDelay => "timer.randomized_delay",
+        Id::ServiceType => "service.type",
+        Id::ExecStart => "service.exec_start",
+        Id::ShellWrap => "service.shell_wrap",
+        Id::ExecStartPre => "service.exec_start_pre",
+        Id::ExecStopPost => "service.exec_stop_post",
+        Id::Restart => "service.restart",
+        Id::RestartSec => "service.restart_sec",
+        Id::WorkDir => "service.working_directory",
+        Id::RunAs => "service.user",
+        Id::Group => "service.group",
+        Id::Env => "service.environment",
+        Id::WantedBy => "service.wanted_by",
+        Id::Preset => "mount.preset",
+        Id::What => "mount.what",
+        Id::Where => "mount.where",
+        Id::FsType => "mount.fstype",
+        Id::Options => "mount.options",
+        Id::Automount => "mount.automount",
+        Id::TimeoutIdle => "mount.timeout_idle",
+        Id::ManualPrimary => "unit.manual_primary",
+        Id::ManualSecondary => "unit.manual_secondary",
+        Id::Preview => "builder.preview",
+        Id::Save => "builder.save",
+    })
+}
+
+/// The schedule chooser, in menu order, keyed to the help document.
+pub const SCHEDULE_KEYS: [&str; 8] = [
+    "schedule.every_minutes",
+    "schedule.every_hours",
+    "schedule.daily",
+    "schedule.weekly",
+    "schedule.monthly",
+    "schedule.boot",
+    "schedule.cron",
+    "schedule.oncalendar",
+];
+
+/// `?` on a row: the full help entry, in a pager, for when the pane is off or
+/// too narrow for the detail paragraph.
+fn explain(term: &mut Term, bg: Background, id: Id) {
+    let Some(e) = help_key(id).and_then(fieldhelp::entry) else {
+        dialogs::msgbox(term, bg, "Help", "No help for this row.");
+        return;
+    };
+    let body = format!("{}\n\n{}\n\nExamples: {}", e.summary, e.detail, e.examples);
+    dialogs::pager(term, bg, &e.label, &wrap_lines(&body, 76).join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Advisory checks
+// ---------------------------------------------------------------------------
+
+/// The directive a row writes, for matching a [`validate::Diagnostic`] to it.
+pub fn directive(id: Id) -> Option<&'static str> {
+    Some(match id {
+        Id::ExecStart => "ExecStart",
+        Id::ExecStartPre => "ExecStartPre",
+        Id::ExecStopPost => "ExecStopPost",
+        Id::WorkDir => "WorkingDirectory",
+        Id::RunAs => "User",
+        Id::Group => "Group",
+        Id::Env => "Environment",
+        _ => return None,
+    })
+}
+
+/// The current value of the directive a fix applies to.
+fn directive_value(u: &Unit, field: &str) -> Option<String> {
+    let s = match &u.body {
+        Body::Timer(t) => &t.service,
+        Body::Service(s) => &s.service,
+        Body::Mount(_) => return None,
+    };
+    Some(match field {
+        "ExecStart" => s.exec_start.clone(),
+        "ExecStartPre" => s.exec_start_pre.clone().unwrap_or_default(),
+        "ExecStopPost" => s.exec_stop_post.clone().unwrap_or_default(),
+        _ => return None,
+    })
+}
+
+/// Apply a suggested fix. Returns what changed, for the status line.
+fn apply_fix(u: &mut Unit, fix: &validate::Fix) -> Option<String> {
+    let field = fix.field().to_string();
+    let current = directive_value(u, &field)?;
+    let new = fix.apply(&current);
+    if new == current {
+        return None;
+    }
+    if matches!(u.body, Body::Mount(_)) {
+        return None;
+    }
+    let s = service_mut(u);
+    match field.as_str() {
+        "ExecStart" => s.exec_start = new,
+        "ExecStartPre" => s.exec_start_pre = Some(new),
+        "ExecStopPost" => s.exec_stop_post = Some(new),
+        _ => return None,
+    }
+    Some(format!("{field}=: {}", fix.label()))
+}
+
+/// The fixable diagnostic that belongs to the focused row, if any.
+fn fix_for_row(d: &Derived, id: Id) -> Option<(&validate::Diagnostic, validate::Fix)> {
+    let field = directive(id)?;
+    d.diags.iter().find_map(|diag| {
+        let fix = validate::autofix(diag)?;
+        (fix.field() == field).then_some((diag, fix))
+    })
+}
+
+/// `f`: apply the focused row's suggested fix.
+fn quick_fix(u: &mut Unit, d: &Derived, id: Id) -> String {
+    match fix_for_row(d, id) {
+        Some((_, fix)) => match apply_fix(u, &fix) {
+            Some(msg) => format!("fixed: {msg}"),
+            None => "nothing to change".into(),
+        },
+        None if d.fixable().is_empty() => {
+            "no suggested fix for this field (c reviews all checks)".into()
+        }
+        None => "no suggested fix for this field; c reviews the ones there are".into(),
+    }
+}
+
+/// `c`: walk the advisory checks, applying fixes. Returns true if the unit
+/// changed.
+fn review_checks(term: &mut Term, bg: Background, u: &mut Unit) -> bool {
+    let mut changed = false;
+    let mut sel = 0usize;
+    loop {
+        let diags = validate::check_unit(u);
+        if diags.is_empty() {
+            dialogs::msgbox(
+                term,
+                bg,
+                "Checks",
+                "No advisories.\n\nThese checks are advice about what systemd will do \
+                 differently from a shell. They never block a save.",
+            );
+            return changed;
+        }
+        let labels: Vec<String> = diags
+            .iter()
+            .map(|d| {
+                let fix = validate::autofix(d).is_some();
+                format!(
+                    "{} {}{}",
+                    if d.level == validate::Level::Error {
+                        "error  "
+                    } else {
+                        "warning"
+                    },
+                    truncate(&d.message, 90),
+                    if fix { "   [Enter fixes]" } else { "" }
+                )
+            })
+            .collect();
+        let Some(i) = dialogs::pick(term, bg, "Checks (advice only)", &labels, sel) else {
+            return changed;
+        };
+        sel = i;
+        match validate::autofix(&diags[i]) {
+            Some(fix) => {
+                if apply_fix(u, &fix).is_some() {
+                    changed = true;
+                } else {
+                    dialogs::msgbox(term, bg, "Cannot apply", &format!("{}", diags[i]));
+                }
+            }
+            None => dialogs::msgbox(
+                term,
+                bg,
+                diags[i].level.as_str(),
+                &wrap_lines(&diags[i].message, 66).join("\n"),
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status line
+// ---------------------------------------------------------------------------
+
+/// The line under the form: the hard gate first, then the focused row's
+/// suggested fix, then advisories, then when the timer next fires.
+fn status_line(u: &Unit, d: &Derived, id: Id) -> String {
+    if let Err(e) = u.validate() {
+        return format!("! {e}");
+    }
+    if let Some((diag, fix)) = fix_for_row(d, id) {
+        return format!("{}: {} -- f applies it", diag.level.as_str(), fix.label());
+    }
+    if !d.diags.is_empty() {
+        let errs = if validate::has_errors(&d.diags) {
+            d.diags
+                .iter()
+                .filter(|x| x.level == validate::Level::Error)
+                .count()
+        } else {
+            0
+        };
+        let warns = d.diags.len() - errs;
+        let mut parts = Vec::new();
+        if errs > 0 {
+            parts.push(format!("{errs} error(s)"));
+        }
+        if warns > 0 {
+            parts.push(format!("{warns} warning(s)"));
+        }
+        return format!(
+            "{} from the advisory checks -- c reviews them",
+            parts.join(", ")
+        );
+    }
+    match &d.runs {
+        Runs::Times(v) if !v.is_empty() => {
+            let next = &v[0];
+            if next.from_now.is_empty() {
+                format!("ready to install   next: {}", next.local)
+            } else {
+                format!(
+                    "ready to install   next: {} ({})",
+                    next.local, next.from_now
+                )
+            }
+        }
+        Runs::Invalid(m) => format!("! {}", m.lines().next().unwrap_or("invalid calendar spec")),
+        Runs::Unavailable => {
+            "ready to install (systemd-analyze missing: schedules unchecked)".into()
+        }
+        _ => "ready to install".into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The event loop
+// ---------------------------------------------------------------------------
+
 /// Run the builder. Returns `true` when the unit was installed.
 pub fn run(term: &mut Term, bg: Background, u: &mut Unit, title: &str) -> bool {
-    let mut sel = first_selectable(&rows_for(u));
-    let mut top = 0usize;
-    let mut status = status_line(u);
+    let width = term.terminal.size().map(|s| s.width).unwrap_or(80);
+    let mut v = View::new(u, title, default_pane(width));
 
     loop {
-        let rows = rows_for(u);
-        sel = sel.min(rows.len().saturating_sub(1));
-        if rows[sel].id == Id::Heading {
-            sel = step(&rows, sel, 1);
-        }
-        let (t, st) = (title.to_string(), status.clone());
-        // Surface the picker on the row it applies to, so it is discoverable
-        // without reading the help.
-        let (browse, browse_style) = if browsable(u, rows[sel].id).is_some() {
-            ("b browses this path", Style::new().bold().fg(Color::Cyan))
-        } else {
-            ("b browses path fields", Style::new().fg(Color::DarkGray))
-        };
-        let s = sel;
-        let mut visible = 1usize;
-        let painted: Vec<(Id, String, String)> = rows
-            .iter()
-            .map(|r| (r.id, r.label.clone(), r.value.clone()))
-            .collect();
-        let tp = top;
-        let _ = term.terminal.draw(|f| {
-            bg(f);
-            let area = f.area();
-            // Four lines, not three: the status and the help line each need
-            // one, and at three the status pushed the keybindings off screen
-            // entirely whenever the unit was still incomplete -- which is
-            // always, when the form has just opened.
-            let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(area);
-            let block = Block::default()
-                .title(format!(" {t} "))
-                .title_style(Style::new().bold())
-                .borders(Borders::ALL);
-            let inner = block.inner(chunks[0]);
-            f.render_widget(block, chunks[0]);
-            visible = inner.height.max(1) as usize;
-            let t0 = if s < tp {
-                s
-            } else if s >= tp + visible {
-                s + 1 - visible
-            } else {
-                tp
-            };
-            let label_w = 22usize;
-            let value_w = (inner.width as usize).saturating_sub(label_w + 4);
-            let lines: Vec<Line> = painted
-                .iter()
-                .enumerate()
-                .skip(t0)
-                .take(visible)
-                .map(|(i, (id, label, value))| {
-                    if *id == Id::Heading {
-                        return Line::from(Span::styled(
-                            format!(" {label}"),
-                            Style::new().bold().fg(Color::Cyan),
-                        ));
-                    }
-                    let v = truncate(value, value_w);
-                    let text = format!(" {} {label:<label_w$} {v}", if i == s { ">" } else { " " });
-                    Line::from(Span::styled(
-                        text,
-                        if i == s {
-                            Style::new().bold().reversed()
-                        } else {
-                            Style::new()
-                        },
-                    ))
-                })
-                .collect();
-            f.render_widget(Paragraph::new(lines), inner);
-
-            // Status and help get a line each and are truncated rather than
-            // wrapped, so neither can ever push the other off the screen.
-            let footer = Block::default().borders(Borders::ALL);
-            let fi = footer.inner(chunks[1]);
-            f.render_widget(footer, chunks[1]);
-            let fr = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(fi);
-            f.render_widget(Paragraph::new(st.as_str()), fr[0]);
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::raw("Enter edits   Tab/arrows move   "),
-                    Span::styled(browse, browse_style),
-                    Span::raw("   p previews   Ctrl-S saves   Esc cancels"),
-                ]))
-                .style(Style::new().fg(Color::DarkGray)),
-                fr[1],
-            );
-        });
-        if sel < top {
-            top = sel;
-        } else if sel >= top + visible {
-            top = sel + 1 - visible;
-        }
+        v.refocus(u);
+        dialogs::draw_over(term, bg, &mut |f| draw(f, &mut v));
 
         let Some(k) = term.next_key() else {
             return false;
         };
-        use super::term::Key;
+        v.flash = None;
         match k {
             Key::Resize | Key::Click(..) | Key::DoubleClick(..) => continue,
-            Key::Scroll(d) => sel = step(&rows, sel, d as isize),
+            Key::Scroll(d) => v.step(d as isize),
             _ if k.is_ctrl('s') => {
                 if save(term, bg, u) {
                     return true;
                 }
-                status = status_line(u);
+                v.sync(u);
             }
             _ => match k.code() {
                 Some(KeyCode::Esc) => {
@@ -371,36 +1072,61 @@ pub fn run(term: &mut Term, bg: Background, u: &mut Unit, title: &str) -> bool {
                         return false;
                     }
                 }
-                Some(KeyCode::Up) | Some(KeyCode::BackTab) => sel = step(&rows, sel, -1),
-                Some(KeyCode::Down) | Some(KeyCode::Tab) => sel = step(&rows, sel, 1),
+                Some(KeyCode::Up) | Some(KeyCode::BackTab) => v.step(-1),
+                Some(KeyCode::Down) | Some(KeyCode::Tab) => v.step(1),
+                Some(KeyCode::PageUp) => v.pane_top = v.pane_top.saturating_sub(PANE_SCROLL),
+                Some(KeyCode::PageDown) => v.pane_top += PANE_SCROLL,
                 Some(KeyCode::Enter) => {
-                    if rows[sel].id == Id::Save {
+                    if v.current() == Id::Save {
                         if save(term, bg, u) {
                             return true;
                         }
                     } else {
-                        activate(term, bg, u, rows[sel].id);
+                        activate(term, bg, u, v.current());
                     }
-                    status = status_line(u);
+                    v.sync(u);
                 }
                 _ if k.is_char('b') => {
-                    if browsable(u, rows[sel].id).is_some() {
-                        browse_field(term, bg, u, rows[sel].id);
-                        status = status_line(u);
+                    if browsable(u, v.current()).is_some() {
+                        browse_field(term, bg, u, v.current());
+                        v.sync(u);
                     } else {
-                        status = "b browses only path fields: ExecStart, ExecStartPre, \
-                                  ExecStopPost, WorkingDirectory, What and Where"
-                            .into();
+                        v.flash = Some(
+                            "b browses only path fields: ExecStart, ExecStartPre, \
+                             ExecStopPost, WorkingDirectory, What and Where"
+                                .into(),
+                        );
                     }
                 }
                 _ if k.is_char('p') => preview(term, bg, u),
-                _ if k.is_char('k') => sel = step(&rows, sel, -1),
-                _ if k.is_char('j') => sel = step(&rows, sel, 1),
+                _ if k.is_char('v') => {
+                    v.pane = v.pane.next();
+                    v.pane_top = 0;
+                    v.flash = Some(match v.pane {
+                        Pane::Off => "pane off -- v brings it back".into(),
+                        p => format!("pane: {}", p.title()),
+                    });
+                }
+                _ if k.is_char('c') => {
+                    review_checks(term, bg, u);
+                    v.sync(u);
+                }
+                _ if k.is_char('f') => {
+                    let msg = quick_fix(u, &v.derived, v.current());
+                    v.sync(u);
+                    v.flash = Some(msg);
+                }
+                _ if k.is_char('?') => explain(term, bg, v.current()),
+                _ if k.is_char('k') => v.step(-1),
+                _ if k.is_char('j') => v.step(1),
                 _ => {}
             },
         }
     }
 }
+
+/// Lines PgUp/PgDn move the pane by.
+const PANE_SCROLL: usize = 10;
 
 fn truncate(s: &str, w: usize) -> String {
     if w == 0 {
@@ -572,7 +1298,10 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
         }
         Id::ExecStart => {
             let cur = service_mut(u).exec_start.clone();
-            if let Some(v) = text!(
+            let comp = |s: &str, _: bool| complete_exec(s);
+            if let Some(v) = dialogs::prompt_ext(
+                term,
+                bg,
                 "ExecStart",
                 "Absolute path plus arguments. Shell syntax needs the wrapper below.",
                 &cur,
@@ -582,9 +1311,16 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
                     } else {
                         Ok(())
                     }
-                }
+                },
+                dialogs::PromptOpts {
+                    complete: Some(&comp),
+                    ..Default::default()
+                },
             ) {
-                service_mut(u).exec_start = v;
+                service_mut(u).exec_start = v.clone();
+                if let Some(n) = suggested_name(&u.name, &v) {
+                    u.name = n;
+                }
             }
         }
         Id::ShellWrap => {
@@ -606,22 +1342,34 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
         }
         Id::ExecStartPre => {
             let cur = service_mut(u).exec_start_pre.clone();
-            service_mut(u).exec_start_pre = ask_optional(
+            let comp = |s: &str, _: bool| complete_exec(s);
+            service_mut(u).exec_start_pre = ask_optional_ext(
                 term,
                 bg,
                 "ExecStartPre",
                 "Runs before ExecStart. Empty clears it.",
                 &cur,
+                "",
+                dialogs::PromptOpts {
+                    complete: Some(&comp),
+                    ..Default::default()
+                },
             );
         }
         Id::ExecStopPost => {
             let cur = service_mut(u).exec_stop_post.clone();
-            service_mut(u).exec_stop_post = ask_optional(
+            let comp = |s: &str, _: bool| complete_exec(s);
+            service_mut(u).exec_stop_post = ask_optional_ext(
                 term,
                 bg,
                 "ExecStopPost",
                 "Runs after the service stops, success or failure. Empty clears it.",
                 &cur,
+                "",
+                dialogs::PromptOpts {
+                    complete: Some(&comp),
+                    ..Default::default()
+                },
             );
         }
         Id::Restart => {
@@ -649,22 +1397,59 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
         }
         Id::WorkDir => {
             let cur = service_mut(u).working_directory.clone();
-            service_mut(u).working_directory = ask_optional(
+            let comp = |s: &str, _: bool| complete::complete_path(s, true);
+            // Unset fields open on the directory notcron was started in --
+            // a prefilled suggestion the user can accept, edit or clear.
+            let seed = templates::suggest_working_directory().unwrap_or_default();
+            service_mut(u).working_directory = ask_optional_ext(
                 term,
                 bg,
                 "WorkingDirectory",
                 "Absolute path the command runs in. Empty clears it.",
                 &cur,
+                &seed,
+                dialogs::PromptOpts {
+                    complete: Some(&comp),
+                    ..Default::default()
+                },
             );
         }
         Id::RunAs => {
             let cur = service_mut(u).run_as.clone();
-            service_mut(u).run_as = ask_optional(
+            let comp = |s: &str, all: bool| {
+                complete::complete_user(s, if all { Accounts::All } else { Accounts::Login })
+            };
+            service_mut(u).run_as = ask_optional_ext(
                 term,
                 bg,
                 "User",
                 "User= (system units only). Empty clears it.",
                 &cur,
+                "",
+                dialogs::PromptOpts {
+                    complete: Some(&comp),
+                    toggle: Some("system accounts"),
+                    ..Default::default()
+                },
+            );
+        }
+        Id::Group => {
+            let cur = service_mut(u).group.clone();
+            let comp = |s: &str, all: bool| {
+                complete::complete_group(s, if all { Accounts::All } else { Accounts::Login })
+            };
+            service_mut(u).group = ask_optional_ext(
+                term,
+                bg,
+                "Group",
+                "Group= (system units only). Empty clears it.",
+                &cur,
+                "",
+                dialogs::PromptOpts {
+                    complete: Some(&comp),
+                    toggle: Some("system groups"),
+                    ..Default::default()
+                },
             );
         }
         Id::Env => {
@@ -712,32 +1497,59 @@ fn activate(term: &mut Term, bg: Background, u: &mut Unit, id: Id) {
             }
         }
         Id::What => {
-            if let Body::Mount(m) = &mut u.body {
-                let help = format!("What to mount, e.g. {}", m.preset.what_hint());
-                if let Some(v) = dialogs::prompt(term, bg, "What", &help, &m.what, &|s: &str| {
+            let Body::Mount(m) = &mut u.body else { return };
+            let help = format!("What to mount, e.g. {}", m.preset.what_hint());
+            let is_path = m.preset.what_is_path();
+            let comp = |s: &str, _: bool| complete::complete_path(s, false);
+            if let Some(v) = dialogs::prompt_ext(
+                term,
+                bg,
+                "What",
+                &help,
+                &m.what,
+                &|s: &str| {
                     if s.trim().is_empty() {
                         Err("What= must not be empty".into())
                     } else {
                         Ok(())
                     }
-                }) {
-                    m.what = v;
+                },
+                dialogs::PromptOpts {
+                    // Only a local path can be completed; an NFS or CIFS
+                    // remote is not one, so the key stays inert there.
+                    complete: is_path.then_some(&comp as dialogs::Completer),
+                    ..Default::default()
+                },
+            ) {
+                m.what = v;
+                if let Some(w) = suggested_where(&m.where_, &m.what) {
+                    m.where_ = w;
                 }
+                u.name = u.stem().unwrap_or_default();
             }
         }
         Id::Where => {
-            if let Body::Mount(m) = &mut u.body {
-                if let Some(v) = dialogs::prompt(
-                    term,
-                    bg,
-                    "Where",
-                    "Absolute mount point. The unit filename is derived from it.",
-                    &m.where_,
-                    &|s: &str| escape::escape_path(s).map(|_| ()),
-                ) {
-                    m.where_ = v;
-                    u.name = u.stem().unwrap_or_default();
-                }
+            let Body::Mount(m) = &mut u.body else { return };
+            let comp = |s: &str, _: bool| complete::complete_path(s, true);
+            let seed = if m.where_.trim().is_empty() {
+                templates::suggest_where(&m.what).unwrap_or_default()
+            } else {
+                m.where_.clone()
+            };
+            if let Some(v) = dialogs::prompt_ext(
+                term,
+                bg,
+                "Where",
+                "Absolute mount point. The unit filename is derived from it.",
+                &seed,
+                &|s: &str| escape::escape_path(s).map(|_| ()),
+                dialogs::PromptOpts {
+                    complete: Some(&comp),
+                    ..Default::default()
+                },
+            ) {
+                m.where_ = v;
+                u.name = u.stem().unwrap_or_default();
             }
         }
         Id::FsType => {
@@ -1009,15 +1821,74 @@ fn unwrap_shell(exec: &str) -> String {
     }
 }
 
-fn ask_optional(
+// ---------------------------------------------------------------------------
+// Smart defaults
+// ---------------------------------------------------------------------------
+
+/// A unit name derived from a command line, or `None` when the unit already
+/// has one.
+///
+/// Suggestion, never overwrite: something the user typed is never replaced,
+/// and the derivation is [`templates::suggest_name`], which shares
+/// `cli::build_exec` with `notcron add` -- so the same job named in the TUI
+/// and on the command line comes out identical.
+fn suggested_name(current: &str, exec: &str) -> Option<String> {
+    if !current.trim().is_empty() {
+        return None;
+    }
+    let name = templates::suggest_name(exec);
+    (!name.is_empty()).then_some(name)
+}
+
+/// A mount point derived from `What=`, or `None` when one is already set.
+fn suggested_where(current: &str, what: &str) -> Option<String> {
+    if !current.trim().is_empty() {
+        return None;
+    }
+    templates::suggest_where(what)
+}
+
+/// Complete only the last whitespace-separated token of `value`, putting the
+/// untouched head back on every candidate.
+///
+/// [`Completion`]'s fields are full replacements for the field text, so the
+/// head has to travel with them -- appending a candidate to what is already
+/// there would double it.
+fn complete_tail(value: &str, f: &dyn Fn(&str) -> Completion) -> Completion {
+    let cut = value.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let (head, tail) = value.split_at(cut);
+    let c = f(tail);
+    Completion {
+        candidates: c.candidates.iter().map(|x| format!("{head}{x}")).collect(),
+        common: format!("{head}{}", c.common),
+    }
+}
+
+/// Completion for an `Exec*=` line: the program must be executable, but an
+/// argument is just as likely to be a path, so only the first token is
+/// filtered by the executable bit.
+fn complete_exec(value: &str) -> Completion {
+    if value.contains(char::is_whitespace) {
+        complete_tail(value, &|t| complete::complete_path(t, false))
+    } else {
+        complete_tail(value, &complete::complete_executable)
+    }
+}
+
+/// [`ask_optional`] with completion, and a `seed` shown when the field is
+/// unset -- a suggestion the user accepts by pressing Enter and refuses by
+/// clearing the line. An already-set field is never seeded over.
+fn ask_optional_ext(
     term: &mut Term,
     bg: Background,
     title: &str,
     help: &str,
     cur: &Option<String>,
+    seed: &str,
+    opts: dialogs::PromptOpts<'_>,
 ) -> Option<String> {
-    let start = cur.clone().unwrap_or_default();
-    match dialogs::prompt(term, bg, title, help, &start, &dialogs::no_validation) {
+    let start = cur.clone().unwrap_or_else(|| seed.to_string());
+    match dialogs::prompt_ext(term, bg, title, help, &start, &dialogs::no_validation, opts) {
         Some(v) if v.trim().is_empty() => None,
         Some(v) => Some(v),
         None => cur.clone(),
@@ -1050,23 +1921,37 @@ fn ask_timespan(
 // Schedule sub-builder
 // ---------------------------------------------------------------------------
 
+/// One line of the schedule chooser, taken from the help document so the
+/// menu and the field help cannot describe the same preset differently.
+fn schedule_item(key: &str) -> String {
+    match fieldhelp::entry(key) {
+        Some(e) => format!("{:<34} {}", e.label, e.summary),
+        None => key.to_string(),
+    }
+}
+
+/// The next-run lines shown live under a schedule prompt.
+///
+/// Only ever called once typing has paused, since each call shells out to
+/// `systemd-analyze`.
+fn note_runs(specs: &[String]) -> Vec<String> {
+    let runs = match systemd::next_runs_multi(specs, RUNS_SHOWN) {
+        Ok(v) => Runs::Times(v),
+        Err(systemd::PreviewError::Unavailable) => Runs::Unavailable,
+        // A half-typed spec is not an error worth shouting about: the
+        // prompt's own validator says so on Enter.
+        Err(systemd::PreviewError::Invalid(_)) => return Vec::new(),
+    };
+    let mut out = vec!["  Next runs:".to_string()];
+    out.extend(runs_lines(&runs, 66).into_iter().map(|l| format!("  {l}")));
+    out
+}
+
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 /// Ask for a schedule, replacing `schedule` and `source` if the user commits.
 fn edit_schedule(term: &mut Term, bg: Background, schedule: &mut Schedule, source: &mut String) {
-    let items: Vec<String> = [
-        "Every N minutes",
-        "Every N hours",
-        "Daily at HH:MM",
-        "Weekly on a weekday at HH:MM",
-        "Monthly on a day of the month at HH:MM",
-        "At boot, after a delay",
-        "Cron expression (translated to OnCalendar)",
-        "Raw OnCalendar spec",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let items: Vec<String> = SCHEDULE_KEYS.iter().map(|k| schedule_item(k)).collect();
 
     let Some(choice) = dialogs::pick(term, bg, "When should it run?", &items, 0) else {
         return;
@@ -1126,13 +2011,28 @@ fn edit_schedule(term: &mut Term, bg: Background, schedule: &mut Schedule, sourc
             &Some("1min".into()),
         )
         .map(|b| (Schedule::Boot { boot: b.clone() }, format!("at boot + {b}"))),
-        6 => dialogs::prompt(
+        6 => dialogs::prompt_ext(
             term,
             bg,
             "Cron expression",
             "5 fields (minute hour day-of-month month day-of-week), or @daily etc.",
             "",
             &|s: &str| cron::to_calendar(s).map(|_| ()).map_err(|e| e.to_string()),
+            dialogs::PromptOpts {
+                note: Some(&|s: &str| match cron::to_calendar(s) {
+                    Ok(Translation::Calendar(specs)) => {
+                        let mut out =
+                            vec![format!("  OnCalendar={}", specs.join("\n  OnCalendar="))];
+                        out.extend(note_runs(&specs));
+                        out
+                    }
+                    Ok(Translation::Reboot) => {
+                        vec!["  OnBootSec=1min -- fires once per boot".into()]
+                    }
+                    Err(_) => Vec::new(),
+                }),
+                ..Default::default()
+            },
         )
         .and_then(|expr| match cron::to_calendar(&expr) {
             Ok(Translation::Calendar(specs)) => calendar(specs, format!("cron: {}", expr.trim())),
@@ -1145,7 +2045,7 @@ fn edit_schedule(term: &mut Term, bg: Background, schedule: &mut Schedule, sourc
             // Unreachable: the prompt validator already rejected it.
             Err(_) => None,
         }),
-        _ => dialogs::prompt(
+        _ => dialogs::prompt_ext(
             term,
             bg,
             "OnCalendar",
@@ -1156,6 +2056,10 @@ fn edit_schedule(term: &mut Term, bg: Background, schedule: &mut Schedule, sourc
                 .map(String::as_str)
                 .unwrap_or(""),
             &|s: &str| systemd::check_calendar(s).map(|_| ()),
+            dialogs::PromptOpts {
+                note: Some(&|s: &str| note_runs(&[s.to_string()])),
+                ..Default::default()
+            },
         )
         .and_then(|spec| calendar(vec![spec.clone()], format!("OnCalendar: {spec}"))),
     };
@@ -1554,6 +2458,573 @@ mod tests {
     #[test]
     fn status_line_reports_validation_failures_first() {
         let u = Unit::new_timer(Scope::User);
-        assert!(status_line(&u).starts_with('!'));
+        let d = Derived::new(&u);
+        assert!(status_line(&u, &d, Id::Name).starts_with('!'));
+    }
+
+    // -----------------------------------------------------------------
+    // Field help
+    // -----------------------------------------------------------------
+
+    fn all_bodies() -> [Unit; 3] {
+        [
+            Unit::new_timer(Scope::User),
+            Unit::new_service(Scope::User),
+            Unit::new_mount(),
+        ]
+    }
+
+    /// Every row the builder can show is described by `docs/field-help.md`.
+    /// This is the guard against a new row shipping with a blank help pane,
+    /// and it is the same docs/code agreement test the options menu has.
+    #[test]
+    fn every_builder_row_has_a_help_entry() {
+        for u in all_bodies() {
+            for r in rows_for(&u) {
+                if r.id == Id::Heading {
+                    assert!(help_key(r.id).is_none(), "headings need no help");
+                    continue;
+                }
+                let key = help_key(r.id).unwrap_or_else(|| panic!("{:?} has no help key", r.id));
+                let e = fieldhelp::entry(key)
+                    .unwrap_or_else(|| panic!("{:?} -> {key}: no such entry", r.id));
+                assert!(!e.label.is_empty(), "{key} has no label");
+                assert!(!e.summary.is_empty(), "{key} has no summary");
+                assert!(!e.detail.is_empty(), "{key} has no detail");
+            }
+        }
+    }
+
+    /// The shell-wrap row has no stable value to show -- it renders
+    /// "(press Enter)" -- so its help is keyed off the row, not the value.
+    #[test]
+    fn the_shell_wrap_row_is_documented_despite_having_no_value() {
+        let u = Unit::new_timer(Scope::User);
+        let row = rows_for(&u)
+            .into_iter()
+            .find(|r| r.id == Id::ShellWrap)
+            .expect("the wrap row");
+        assert_eq!(row.value, "(press Enter)");
+        let e = fieldhelp::entry(help_key(Id::ShellWrap).unwrap()).expect("help");
+        assert!(!e.summary.is_empty());
+    }
+
+    #[test]
+    fn every_schedule_preset_is_documented_and_offered() {
+        for key in SCHEDULE_KEYS {
+            let e = fieldhelp::entry(key).unwrap_or_else(|| panic!("{key}: no such entry"));
+            assert!(!e.summary.is_empty(), "{key}");
+            let item = schedule_item(key);
+            assert!(item.contains(&e.label), "{key} -> {item}");
+            assert!(item.contains(&e.summary), "{key} -> {item}");
+        }
+        // The chooser's arms and the key list must stay the same length --
+        // `edit_schedule` indexes one by the other.
+        assert_eq!(SCHEDULE_KEYS.len(), 8);
+    }
+
+    #[test]
+    fn help_lines_fall_back_rather_than_panicking() {
+        assert_eq!(help_key(Id::Heading), None);
+        assert_eq!(help_lines(Id::Heading, 40), vec!["(no help for this row)"]);
+        let lines = help_lines(Id::ExecStart, 40);
+        assert!(lines.iter().any(|l| l.contains("ExecStart")));
+        assert!(lines.iter().all(|l| l.chars().count() <= 40));
+    }
+
+    // -----------------------------------------------------------------
+    // Layout
+    // -----------------------------------------------------------------
+
+    fn rect(w: u16, h: u16) -> Rect {
+        Rect {
+            x: 3,
+            y: 2,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn the_pane_never_escapes_the_area_or_starves_the_form() {
+        for w in 0..=140u16 {
+            for h in [0u16, 1, 2, 3, 5, 24, 40] {
+                let a = rect(w, h);
+                for on in [false, true] {
+                    let (form, pane) = split_panes(a, on);
+                    assert!(form.x >= a.x && form.y == a.y, "{w}x{h}");
+                    assert!(form.x + form.width <= a.x + a.width, "{w}x{h}");
+                    assert!(form.height == a.height, "{w}x{h}");
+                    match pane {
+                        None => assert_eq!(form.width, a.width, "{w}x{h} on={on}"),
+                        Some(p) => {
+                            assert!(on, "a pane appeared while off");
+                            assert_eq!(form.x + form.width, p.x, "{w}x{h}: a gap or an overlap");
+                            assert_eq!(p.x + p.width, a.x + a.width, "{w}x{h}");
+                            assert!(p.width >= PANE_MIN, "{w}x{h}: {} wide", p.width);
+                            assert!(form.width >= FORM_MIN, "{w}x{h}: form starved");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A permanent split does not fit an 80-column terminal, so it is off
+    /// there and one keypress away. Anything roomier opens with it on.
+    #[test]
+    fn the_pane_is_off_by_default_on_a_narrow_terminal() {
+        assert_eq!(default_pane(80), Pane::Off);
+        assert_eq!(default_pane(99), Pane::Off);
+        assert_eq!(default_pane(100), Pane::Help);
+        assert_eq!(default_pane(200), Pane::Help);
+        // ...but it still fits when asked for at 80 columns.
+        let (form, pane) = split_panes(rect(78, 20), true);
+        assert!(pane.is_some(), "v must work at 80 columns");
+        assert!(form.width >= FORM_MIN);
+    }
+
+    /// The way out has to stay visible. At 80 columns the full hint line is
+    /// exactly as wide as the footer; anything narrower drops whole hints
+    /// from the least important end rather than clipping the last one.
+    #[test]
+    fn the_keybinding_line_never_clips_the_way_out() {
+        for browse in ["b browses this path", "b browses paths"] {
+            for width in 0..=120usize {
+                let hints = key_hints(browse, width);
+                assert!(hints.contains(&"Esc cancel".to_string()), "{width}");
+                assert!(hints.contains(&"^S save".to_string()), "{width}");
+                assert!(hints.contains(&"Enter edit".to_string()), "{width}");
+                let used = hints.iter().map(|h| h.chars().count()).sum::<usize>()
+                    + 2 * hints.len().saturating_sub(1);
+                // Either it fits, or nothing droppable is left.
+                assert!(
+                    used <= width || hints.len() == 3,
+                    "{width}: {used} wide, {hints:?}"
+                );
+            }
+        }
+        // A standard 80-column terminal keeps every hint.
+        assert_eq!(key_hints("b browses this path", 78).len(), 7);
+    }
+
+    #[test]
+    fn cycling_the_pane_visits_every_mode_and_returns() {
+        let mut p = Pane::Help;
+        let mut seen = vec![p];
+        for _ in 0..Pane::CYCLE.len() {
+            p = p.next();
+            seen.push(p);
+        }
+        assert_eq!(seen.last(), Some(&Pane::Help), "the cycle must close");
+        for mode in Pane::CYCLE {
+            assert!(seen.contains(&mode), "{mode:?} unreachable");
+        }
+        assert!(Pane::Off.title().is_empty());
+    }
+
+    /// Everything the pane paints fits inside it, at any width.
+    #[test]
+    fn pane_bodies_are_clipped_to_the_pane() {
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "backup".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.service.exec_start = "/usr/bin/rsync -aHAX --delete /home/ /srv/backup/home/".into();
+        }
+        let d = Derived::new(&u);
+        for width in [8usize, 12, 26, 40, 80] {
+            for pane in Pane::CYCLE {
+                for id in [Id::Name, Id::ExecStart, Id::Schedule, Id::Save] {
+                    for line in pane_body(pane, id, &d, width) {
+                        assert!(
+                            line.chars().count() <= width.max(8),
+                            "{pane:?} {id:?} at {width}: {line:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapping_breaks_paragraphs_and_never_overflows() {
+        let out = wrap_lines("one two three four five", 10);
+        assert!(out.iter().all(|l| l.chars().count() <= 10), "{out:?}");
+        assert_eq!(out.join(" ").split_whitespace().count(), 5);
+        // Blank lines survive as paragraph breaks.
+        assert_eq!(wrap_lines("a\n\nb", 20), vec!["a", "", "b"]);
+        // An unbreakable word is cut rather than allowed to overflow.
+        let long = wrap_lines(&"x".repeat(40), 10);
+        assert!(long.iter().all(|l| l.chars().count() <= 10), "{long:?}");
+        assert!(wrap_lines("", 10).len() <= 1);
+    }
+
+    /// The whole screen, painted at every size down to 1x1, in every pane
+    /// mode and for every body. Nothing here may panic or overflow a buffer.
+    #[test]
+    fn the_builder_draws_at_any_terminal_size() {
+        use ratatui::backend::TestBackend;
+        for u in all_bodies() {
+            for pane in Pane::CYCLE {
+                let mut v = View::new(&u, "Test", pane);
+                for w in [1u16, 2, 5, 20, 46, 71, 72, 80, 100, 160] {
+                    for h in [1u16, 2, 3, 4, 5, 6, 24, 50] {
+                        let mut t = Terminal::new(TestBackend::new(w, h)).expect("backend");
+                        v.pane_top = 0;
+                        t.draw(|f| draw(f, &mut v)).expect("draw");
+                        // ...and again, scrolled past the end of the body.
+                        v.pane_top = 9_999;
+                        t.draw(|f| draw(f, &mut v)).expect("draw scrolled");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_form_still_shows_a_value_column_at_eighty_columns() {
+        use ratatui::backend::TestBackend;
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "backup".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.service.exec_start = "/opt/bk.sh".into();
+        }
+        let mut v = View::new(&u, "Test", Pane::Help);
+        let mut t = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        t.draw(|f| draw(f, &mut v)).expect("draw");
+        let text: String = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("/opt/bk.sh"), "the value column vanished");
+        assert!(text.contains("Field help"), "the pane vanished");
+    }
+
+    // -----------------------------------------------------------------
+    // Derived state
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn derived_preview_is_the_generated_files() {
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "backup".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.service.exec_start = "/bin/true".into();
+        }
+        let d = Derived::new(&u);
+        assert_eq!(
+            d.preview,
+            generate::preview(&u, &systemd::unit_dir(u.scope).to_string_lossy())
+        );
+        assert!(d.preview.contains("[Timer]") && d.preview.contains("[Service]"));
+    }
+
+    /// The live preview follows the form, manual block included.
+    #[test]
+    fn the_preview_follows_every_edit_including_the_manual_block() {
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "backup".into();
+        let mut d = Derived::new(&u);
+        let before = d.preview.clone();
+        if let Body::Timer(t) = &mut u.body {
+            t.service_manual = "Nice=19\n".into();
+        }
+        d.refresh(&u);
+        assert_ne!(d.preview, before);
+        assert!(d.preview.contains("Nice=19"), "{}", d.preview);
+        assert!(d.preview.contains("notcron:manual"));
+    }
+
+    /// An interval or boot timer has no calendar, and must not be shown an
+    /// empty run list as though something had gone wrong.
+    #[test]
+    fn schedules_without_a_calendar_explain_themselves() {
+        for (schedule, needle) in [
+            (
+                Schedule::Every {
+                    every: "15min".into(),
+                    boot: "5min".into(),
+                },
+                "interval timer",
+            ),
+            (
+                Schedule::Boot {
+                    boot: "1min".into(),
+                },
+                "boot timer",
+            ),
+        ] {
+            let mut u = Unit::new_timer(Scope::User);
+            u.name = "x".into();
+            if let Body::Timer(t) = &mut u.body {
+                t.schedule = schedule;
+            }
+            let d = Derived::new(&u);
+            let Runs::NotCalendar(why) = &d.runs else {
+                panic!("expected no calendar, got {:?}", d.runs);
+            };
+            assert!(why.contains(needle), "{why}");
+            let lines = runs_lines(&d.runs, 40);
+            assert!(!lines.is_empty() && lines.iter().all(|l| l.chars().count() <= 40));
+        }
+        // Neither does a mount or a standalone service.
+        for u in [Unit::new_service(Scope::User), Unit::new_mount()] {
+            assert!(matches!(Derived::new(&u).runs, Runs::NotCalendar(_)));
+        }
+    }
+
+    /// A missing systemd-analyze is a fact about the host, not a mistake by
+    /// the user, and must never read as one.
+    #[test]
+    fn an_unavailable_analyzer_is_not_reported_as_a_user_error() {
+        let lines = runs_lines(&Runs::Unavailable, 60).join(" ");
+        assert!(lines.contains("unavailable"), "{lines}");
+        assert!(!lines.contains('!'), "{lines}");
+        // An invalid spec, by contrast, is flagged.
+        let bad = runs_lines(&Runs::Invalid("no such day".into()), 60).join(" ");
+        assert!(bad.contains('!') && bad.contains("no such day"));
+    }
+
+    #[test]
+    fn a_calendar_that_never_fires_again_says_so() {
+        let lines = runs_lines(&Runs::Times(Vec::new()), 60).join(" ");
+        assert!(lines.contains("never"), "{lines}");
+    }
+
+    #[test]
+    fn run_times_are_numbered_and_carry_the_relative_form() {
+        let runs = Runs::Times(vec![systemd::NextRun {
+            local: "Mon 2026-08-17 03:00:00 CEST".into(),
+            utc: String::new(),
+            from_now: "1 day 23h left".into(),
+        }]);
+        let lines = runs_lines(&runs, 60);
+        assert!(lines[0].starts_with("1. Mon 2026-08-17"), "{lines:?}");
+        assert!(lines[1].contains("1 day 23h left"), "{lines:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // Advisory checks
+    // -----------------------------------------------------------------
+
+    /// The advisory checks never gate a save: a unit that trips every one of
+    /// them still passes the structural validation that does.
+    #[test]
+    fn advisories_do_not_block_saving() {
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "x".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.schedule = Schedule::Calendar(vec!["*-*-* 03:00:00".into()]);
+            t.service.exec_start = "definitely-not-a-real-binary".into();
+        }
+        let d = Derived::new(&u);
+        assert!(!d.diags.is_empty(), "expected an advisory");
+        assert!(u.validate().is_ok(), "the hard gate must still pass");
+    }
+
+    #[test]
+    fn the_bare_command_warning_carries_a_one_key_fix() {
+        let Some(real) = validate::which("true") else {
+            eprintln!("skipping: no 'true' on PATH");
+            return;
+        };
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "x".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.service.exec_start = "true --quiet".into();
+        }
+        let d = Derived::new(&u);
+        let (_, fix) = fix_for_row(&d, Id::ExecStart).expect("a fix for ExecStart");
+        assert_eq!(fix.field(), "ExecStart");
+        assert!(fix.label().contains(&real.display().to_string()));
+        // Applying it keeps the arguments.
+        let msg = quick_fix(&mut u, &d, Id::ExecStart);
+        assert!(msg.starts_with("fixed:"), "{msg}");
+        let Body::Timer(t) = &u.body else {
+            unreachable!()
+        };
+        assert_eq!(t.service.exec_start, format!("{} --quiet", real.display()));
+        // ...and the advisory is gone afterwards.
+        assert!(fix_for_row(&Derived::new(&u), Id::ExecStart).is_none());
+    }
+
+    #[test]
+    fn a_row_with_no_fix_says_so_instead_of_doing_nothing() {
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "x".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.service.exec_start = "/bin/sh".into();
+        }
+        let d = Derived::new(&u);
+        let msg = quick_fix(&mut u, &d, Id::Description);
+        assert!(msg.contains("no suggested fix"), "{msg}");
+    }
+
+    #[test]
+    fn only_rows_that_write_a_directive_can_match_a_diagnostic() {
+        assert_eq!(directive(Id::ExecStart), Some("ExecStart"));
+        assert_eq!(directive(Id::RunAs), Some("User"));
+        assert_eq!(directive(Id::Group), Some("Group"));
+        assert_eq!(directive(Id::Heading), None);
+        assert_eq!(directive(Id::Save), None);
+    }
+
+    #[test]
+    fn the_status_line_offers_the_focused_rows_fix() {
+        if validate::which("true").is_none() {
+            eprintln!("skipping: no 'true' on PATH");
+            return;
+        }
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "x".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.schedule = Schedule::Calendar(vec!["*-*-* 03:00:00".into()]);
+            t.service.exec_start = "true".into();
+        }
+        let d = Derived::new(&u);
+        let on_exec = status_line(&u, &d, Id::ExecStart);
+        assert!(on_exec.contains("f applies it"), "{on_exec}");
+        // On another row the same advisory is still counted, not hidden.
+        let elsewhere = status_line(&u, &d, Id::Description);
+        assert!(elsewhere.contains("advisory checks"), "{elsewhere}");
+    }
+
+    #[test]
+    fn a_clean_unit_reports_readiness_rather_than_advice() {
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "x".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.schedule = Schedule::Calendar(vec!["*-*-* 03:00:00".into()]);
+            t.service.exec_start = "/bin/true".into();
+        }
+        let d = Derived::new(&u);
+        let line = status_line(&u, &d, Id::ExecStart);
+        assert!(line.starts_with("ready to install"), "{line}");
+    }
+
+    #[test]
+    fn the_checks_pane_says_it_is_advice_either_way() {
+        let mut u = Unit::new_timer(Scope::User);
+        u.name = "x".into();
+        if let Body::Timer(t) = &mut u.body {
+            t.service.exec_start = "/bin/true".into();
+        }
+        let clean = pane_body(Pane::Checks, Id::ExecStart, &Derived::new(&u), 60).join(" ");
+        assert!(clean.contains("No advisories"), "{clean}");
+        assert!(
+            clean.contains("never a gate") || clean.contains("advice"),
+            "{clean}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Completion
+    // -----------------------------------------------------------------
+
+    struct Tree(tempfile::TempDir);
+
+    impl Tree {
+        fn new() -> Tree {
+            use std::os::unix::fs::PermissionsExt;
+            let d = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(d.path().join("bin")).unwrap();
+            std::fs::write(d.path().join("bin/plain"), "x").unwrap();
+            let run = d.path().join("bin/runner");
+            std::fs::write(&run, "x").unwrap();
+            std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Tree(d)
+        }
+        fn at(&self, rel: &str) -> String {
+            format!("{}/{rel}", self.0.path().display())
+        }
+    }
+
+    /// Candidates are full replacements for the *field*, not for the token --
+    /// so the untouched head of the line has to come back with them.
+    #[test]
+    fn completing_an_argument_keeps_the_rest_of_the_command_line() {
+        let t = Tree::new();
+        let line = format!("/bin/echo {}", t.at("bin/pl"));
+        let c = complete_exec(&line);
+        assert_eq!(c.common, format!("/bin/echo {}", t.at("bin/plain")));
+        assert!(
+            c.candidates.iter().all(|x| x.starts_with("/bin/echo ")),
+            "{c:?}"
+        );
+    }
+
+    /// The program is filtered by the executable bit; an argument is not.
+    #[test]
+    fn only_the_program_is_filtered_by_the_executable_bit() {
+        let t = Tree::new();
+        let prog = complete_exec(&t.at("bin/"));
+        assert_eq!(prog.candidates, vec![t.at("bin/runner")]);
+        let arg = complete_exec(&format!("/bin/echo {}", t.at("bin/")));
+        assert_eq!(arg.candidates.len(), 2, "{arg:?}");
+    }
+
+    #[test]
+    fn no_match_leaves_the_field_exactly_as_typed() {
+        let t = Tree::new();
+        let line = format!("/bin/echo {}", t.at("zzz"));
+        let c = complete_exec(&line);
+        assert!(c.is_empty());
+        // Blind assignment of `common` is safe: it is the input again.
+        assert_eq!(c.common, line);
+    }
+
+    #[test]
+    fn completing_a_bare_program_replaces_the_whole_field() {
+        let t = Tree::new();
+        let c = complete_exec(&t.at("bin/run"));
+        assert!(c.is_unique());
+        assert_eq!(c.common, t.at("bin/runner"));
+    }
+
+    // -----------------------------------------------------------------
+    // Smart defaults
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_name_is_suggested_only_for_an_unnamed_unit() {
+        assert_eq!(
+            suggested_name("", "/usr/local/bin/backup.sh --full"),
+            Some("backup-sh".to_string())
+        );
+        // Anything the user typed is left alone.
+        assert_eq!(suggested_name("mine", "/usr/local/bin/backup.sh"), None);
+        assert_eq!(suggested_name("  ", "  "), None);
+    }
+
+    /// The TUI and `notcron add` must derive the same name from the same
+    /// command, because both go through `cli::build_exec`.
+    #[test]
+    fn the_suggested_name_matches_what_the_cli_would_pick() {
+        for cmd in [
+            "/usr/local/bin/backup.sh --full",
+            "/usr/bin/rsync -a /a /b",
+            "/usr/bin/env python3 /opt/job.py",
+        ] {
+            let args: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            let (_, hint) = crate::cli::build_exec(&args, false);
+            assert_eq!(
+                suggested_name("", cmd),
+                Some(escape::slugify(&hint)),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mount_point_is_suggested_only_for_a_mount_without_one() {
+        assert_eq!(
+            suggested_where("", "//server/share"),
+            Some("/mnt/share".to_string())
+        );
+        assert_eq!(suggested_where("/srv/here", "//server/share"), None);
+        assert_eq!(suggested_where("", ""), None);
     }
 }

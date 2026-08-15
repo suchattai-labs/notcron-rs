@@ -96,15 +96,113 @@ scope.
 | `↑`/`↓`, `k`/`j` | move | `s` / `S` | start / stop |
 | `Home` / `End` | first / last | `a` / `d` | enable / disable |
 | `n` | new unit | `i` | `systemctl status` |
-| `Enter`, `e` | edit (owned units only) | `l` | journal |
-| `x` | remove (stop, disable, delete, reload) | `v` | view the raw unit files |
-| `u` | switch user ↔ system scope | `r` | `daemon-reload` |
-| `f` | show/hide foreign units | `?` | help |
-| `q`, `Esc` | quit | | |
+| `y` | copy the selected unit | `l` | journal |
+| `Enter`, `e` | edit (owned units only) | `v` | view the raw unit files |
+| `x` | remove (stop, disable, delete, reload) | `r` | `daemon-reload` |
+| `u` | switch user ↔ system scope | `?` | help |
+| `f` | show/hide foreign units | `q`, `Esc` | quit |
 
 Inside a builder form: `Enter` edits the selected field, `Tab`/arrows move,
-`b` browses the filesystem for the selected path field, `p` previews the
-generated files, `Ctrl-S` saves, `Esc` cancels.
+`b` browses the filesystem for the selected path field, `v` cycles the side
+pane, `c` reviews the advisory checks, `f` applies a suggested fix, `?` opens
+the full help for the focused row, `p` previews the generated files, `Ctrl-S`
+saves, `Esc` cancels. Inside a text field `Tab` completes instead — the field
+prompt is modal, so the two never collide.
+
+### The side pane
+
+The builder carries a pane beside the form, cycled with `v`:
+
+| pane | shows |
+|---|---|
+| **Field help** | what the focused row does, from `docs/field-help.md` |
+| **Unit files** | the generated `.timer`/`.service`/`.mount`, live |
+| **Next runs** | the next five times the timer will fire |
+| **Checks** | the advisory checks, and which have a one-key fix |
+| off | nothing; `v` again brings it back |
+
+`PgUp`/`PgDn` scroll it. Everything in it follows the form as you type: the
+unit-file pane re-renders on every edit, manual block included, so `p` is now
+only for reading the files full-screen.
+
+The pane is **on by default at 100 columns or wider and off below that**. A
+permanent split does not fit an 80×24 terminal — the form needs 46 columns to
+show a path next to its label — so on a standard terminal it is one keypress
+away rather than always there. Turned on at 80 columns it still works; the
+value column just gets shorter.
+
+**Next runs** come from `systemd-analyze calendar`, merged across every
+`OnCalendar=` line because systemd fires on their union. Interval and boot
+timers have no calendar to analyse and say so instead of showing an empty
+list, and a host without `systemd-analyze` gets "preview unavailable" — not an
+error, since nothing is wrong with the schedule. The raw `OnCalendar` and cron
+prompts show the same list live under the field as you type, recomputed once
+typing pauses rather than once per keystroke.
+
+### Advisory checks
+
+`ExecStart=` is not run through a shell and is not resolved through `$PATH`,
+which is the usual reason a command that works in a terminal fails as a unit.
+The builder checks for that and a few neighbours — a relative or missing
+binary, a non-existent `WorkingDirectory=`, `User=`/`Group=` in a user unit,
+an `Environment` line that is not `KEY=VALUE`.
+
+**None of it blocks a save.** The structural validation is the gate; this is
+advice, shown in the status line and in the Checks pane, and `c` walks the
+whole list.
+
+Two of them come with the answer already computed, so `f` applies it on the
+focused row:
+
+```
+warning: ExecStart=: 'rsync' is not an absolute path; systemd does not
+         search $PATH — use '/usr/bin/rsync'          f -> /usr/bin/rsync -a ...
+warning: ExecStart= contains shell syntax, but systemd does not use a shell
+                                                     f -> /bin/sh -c "..."
+```
+
+The path fix keeps the arguments; the wrapper fix quotes the whole line.
+
+### Completing paths, users and groups
+
+`Tab` inside a text field completes to the longest common prefix first and
+lists the candidates on the next press, as a shell does.
+
+| field | completes |
+|---|---|
+| `ExecStart`, `ExecStartPre`, `ExecStopPost` | the program against executables, an argument against any path |
+| `WorkingDirectory`, mount `Where` | directories |
+| mount `What` | any path, for block-device and bind mounts only |
+| `User` / `Group` | `/etc/passwd` and `/etc/group` |
+
+Accounts are filtered to ones a job plausibly runs as — `root` plus uid ≥ 1000
+with a real shell — because a distro's forty system accounts bury the three
+that matter. `Ctrl-A` in the prompt widens it to all of them, so `www-data`
+and `nobody` are one keypress away.
+
+### Templates, copies and suggestions
+
+`n` offers **From a template**: a nightly backup, a periodic sync, a cache
+warmer. Each is a complete working unit — schedule, `Persistent=`, `Nice=`,
+a mount-point guard — with an obvious placeholder command to replace, rather
+than an empty form.
+
+`n` also offers **From an existing unit**, and `y` on the list does the same
+in one key: a copy of one of your units, renamed to something free
+(`backup-copy`, then `backup-copy-2`) and marked as a copy in its
+description. A mount clone renames `Where=` instead, since that is what its
+filename is derived from. Nothing about the original's installed state comes
+along — the copy is not installed until you save it.
+
+Three fields prefill themselves, and only when they are empty:
+
+- **Name** from the command, using the same derivation `notcron add` uses, so
+  the same job named in either place comes out identical.
+- **WorkingDirectory** from the directory notcron was started in.
+- Mount **Where** from **What** — `//server/share` suggests `/mnt/share`,
+  `/dev/disk/by-uuid/1234abcd…` suggests `/mnt/disk-1234abcd`.
+
+Anything you typed is never overwritten.
 
 ### Browsing for paths
 
@@ -145,7 +243,7 @@ status line and leaves you where you were.
 
 **Timer + service.** Command, schedule, `Persistent=`, `RandomizedDelaySec=`,
 and the common `[Service]` knobs (`Type=`, `WorkingDirectory=`, `User=`,
-`Environment=`, `ExecStartPre=`, `ExecStopPost=`). The schedule step offers
+`Group=`, `Environment=`, `ExecStartPre=`, `ExecStopPost=`). The schedule step offers
 every N minutes, every N hours, daily at HH:MM, weekly on a weekday, monthly
 on a day of the month, at boot after a delay, a cron expression, or a raw
 `OnCalendar` spec. Every resulting `OnCalendar` value is checked with
@@ -215,7 +313,10 @@ bargain the manual block strikes for directives elsewhere.
 
 The per-option help is generated from `docs/field-help.md`, which is embedded
 at build time; the text you read in the TUI and the text in the repo are the
-same string.
+same string. So is the help pane for every builder field, the labels in the
+schedule chooser and the `?` help on the list screen — a test asserts that
+every row, preset and action resolves to an entry, so a new field cannot ship
+with a blank pane.
 
 Every builder has a **manual directives** row that drops into a free-text
 editor for arbitrary extra lines — whole `[Section]` blocks are fine. That is
@@ -345,7 +446,9 @@ cargo test
 Covers the cron translator (every case from the shell suite, including the
 rejection cases), unit generation, parse round-trip losslessness, systemd
 path escaping checked against the real `systemd-escape`, the text editor
-buffer, and TUI layout at terminal sizes down to 1×1. Tests that need
+buffer, the advisory checks and their fixes, completion, and TUI layout at
+terminal sizes down to 1×1 — including the builder painting every pane mode
+at every size. Tests that need
 `systemd-analyze` or `systemd-escape` skip themselves when those binaries are
 absent, so CI without systemd stays green.
 

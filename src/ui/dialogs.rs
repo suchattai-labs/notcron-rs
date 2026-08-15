@@ -3,11 +3,13 @@
 //! caller-supplied background underneath itself.
 
 use super::term::{popup_rect, Key, Term};
+use crate::complete::Completion;
 use crossterm::event::KeyCode;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use std::time::Duration;
 
 pub type Background<'a> = &'a mut dyn FnMut(&mut Frame);
 
@@ -89,6 +91,34 @@ pub fn confirm(term: &mut Term, bg: Background, title: &str, body: &str) -> bool
     }
 }
 
+/// Tab completion for a field: the whole field text plus the state of the
+/// Ctrl-A toggle in, a set of full replacements for it out.
+pub type Completer<'a> = &'a dyn Fn(&str, bool) -> Completion;
+
+/// Extra lines under the field, computed from what is typed so far.
+pub type Note<'a> = &'a dyn Fn(&str) -> Vec<String>;
+
+/// Optional behaviours a prompt can take on.
+///
+/// Kept as a struct rather than more arguments because most prompts want
+/// none of it: [`prompt`] is the plain form and passes `PromptOpts::default()`.
+#[derive(Default)]
+pub struct PromptOpts<'a> {
+    /// Tab completion for this field. The `bool` is the state of the
+    /// Ctrl-A toggle, for completers that offer a wider set on request.
+    pub complete: Option<Completer<'a>>,
+    /// What Ctrl-A widens to, e.g. `all accounts`. `None` hides the toggle
+    /// and pins the completer's flag to `false`.
+    pub toggle: Option<&'a str>,
+    /// Extra lines under the field, recomputed once typing pauses. Used for
+    /// the next-run preview, which costs a subprocess and must not run on
+    /// every keystroke.
+    pub note: Option<Note<'a>>,
+}
+
+/// How long typing has to stop before a [`PromptOpts::note`] is recomputed.
+const NOTE_DEBOUNCE: Duration = Duration::from_millis(250);
+
 /// Single-line text prompt. Returns `None` on Escape.
 ///
 /// `validate` runs on Enter; returning `Err` keeps the dialog open and shows
@@ -102,8 +132,43 @@ pub fn prompt(
     initial: &str,
     validate: &dyn Fn(&str) -> Result<(), String>,
 ) -> Option<String> {
+    prompt_ext(
+        term,
+        bg,
+        title,
+        help,
+        initial,
+        validate,
+        PromptOpts::default(),
+    )
+}
+
+/// The full prompt: [`prompt`] plus completion and a live note.
+///
+/// Tab completes to the longest common prefix first and lists the candidates
+/// on the next press, which is the shell contract. Tab is free here because
+/// the prompt is modal -- it still moves between fields in the form behind it.
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_ext(
+    term: &mut Term,
+    bg: Background,
+    title: &str,
+    help: &str,
+    initial: &str,
+    validate: &dyn Fn(&str) -> Result<(), String>,
+    opts: PromptOpts<'_>,
+) -> Option<String> {
     let mut value = initial.to_string();
     let mut err = String::new();
+    // Candidates are only listed once completing has stopped making progress,
+    // so a unique match never flashes a one-item list at the user.
+    let mut candidates: Vec<String> = Vec::new();
+    let mut all = false;
+    let mut note: Vec<String> = Vec::new();
+    // The value `note` describes; `None` means "stale, recompute when the
+    // user pauses".
+    let mut note_for: Option<String> = None;
+
     loop {
         let (t, h, v, e) = (
             title.to_string(),
@@ -111,12 +176,15 @@ pub fn prompt(
             value.clone(),
             err.clone(),
         );
+        let cands = candidates.clone();
+        let note_now = note.clone();
+        let keys = keybinding_line(&opts, all);
         draw_over(term, bg, &mut |f| {
             // The width is fixed, so the wrapped height can be measured
             // before the rect is chosen. It has to be: a multi-line help --
             // a field summary plus its examples -- used to push the error
             // and the keybindings out of a box that was always nine rows,
-            // which meant a rejected value looked like a dead key.
+            // which meant a rejected value looked like a dead keyboard.
             let width = 74u16.min(f.area().width.saturating_sub(2)).max(1);
             let inner_w = width.saturating_sub(4) as usize;
             let shown: String = if v.chars().count() > inner_w {
@@ -125,11 +193,13 @@ pub fn prompt(
                 v.clone()
             };
             let body = format!(
-                "{h}\n\n  {shown}_\n\n{}\n  Enter accepts, Esc cancels",
+                "{h}\n\n  {shown}_\n{}{}\n{}{keys}",
+                block_of(&candidate_lines(&cands, inner_w)),
+                block_of(&note_now),
                 if e.is_empty() {
                     String::new()
                 } else {
-                    format!("  ! {e}")
+                    format!("  ! {e}\n")
                 }
             );
             let height = wrapped_height(&body, inner_w.max(1)) as u16 + 2;
@@ -142,31 +212,122 @@ pub fn prompt(
                 area,
             );
         });
-        let k = term.next_key()?;
+
+        // A stale note is recomputed only once typing pauses: it may cost a
+        // subprocess, and one per keystroke would be unusable.
+        let k = match (&opts.note, note_for.as_deref() == Some(value.as_str())) {
+            (Some(f), false) => match term.poll_key(NOTE_DEBOUNCE) {
+                Some(k) => k,
+                None => {
+                    note = f(&value);
+                    note_for = Some(value.clone());
+                    continue;
+                }
+            },
+            _ => term.next_key()?,
+        };
+
         match k {
             Key::Resize | Key::Scroll(_) | Key::Click(..) | Key::DoubleClick(..) => continue,
+            _ if k.is_ctrl('a') && opts.toggle.is_some() => {
+                all = !all;
+                candidates.clear();
+                err.clear();
+            }
+            _ if k.is_ctrl('u') => {
+                value.clear();
+                candidates.clear();
+                err.clear();
+            }
             _ => match k.code() {
                 Some(KeyCode::Esc) => return None,
                 Some(KeyCode::Enter) => match validate(&value) {
                     Ok(()) => return Some(value),
                     Err(e) => err = e,
                 },
+                Some(KeyCode::Tab) | Some(KeyCode::BackTab) => {
+                    if let Some(f) = opts.complete {
+                        let c = f(&value, all && opts.toggle.is_some());
+                        candidates.clear();
+                        err.clear();
+                        if c.is_empty() {
+                            err = "no completions".into();
+                        } else if c.common != value {
+                            // `common` is a full replacement for the field,
+                            // never something to append to it.
+                            value = c.common;
+                        } else if !c.is_unique() {
+                            candidates = c.candidates;
+                        }
+                    }
+                }
                 Some(KeyCode::Backspace) => {
                     value.pop();
+                    candidates.clear();
                     err.clear();
                 }
                 Some(KeyCode::Char(c)) if !k.is_ctrl(c) => {
                     value.push(c);
-                    err.clear();
-                }
-                Some(KeyCode::Char('u')) if k.is_ctrl('u') => {
-                    value.clear();
+                    candidates.clear();
                     err.clear();
                 }
                 _ => {}
             },
         }
     }
+}
+
+/// Render a group of lines as a block, or nothing at all when it is empty --
+/// so an absent note costs no vertical space.
+fn block_of(lines: &[String]) -> String {
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", lines.join("\n"))
+    }
+}
+
+/// Candidates as displayable lines: at most [`CANDIDATE_ROWS`] of them, each
+/// clipped to the box, with a count of whatever did not fit.
+pub fn candidate_lines(candidates: &[String], width: usize) -> Vec<String> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let width = width.max(8);
+    let mut out: Vec<String> = candidates
+        .iter()
+        .take(CANDIDATE_ROWS)
+        .map(|c| {
+            let text = format!("  - {c}");
+            text.chars().take(width).collect()
+        })
+        .collect();
+    if candidates.len() > CANDIDATE_ROWS {
+        out.push(format!(
+            "  ... and {} more",
+            candidates.len() - CANDIDATE_ROWS
+        ));
+    }
+    out
+}
+
+/// How many completion candidates the prompt lists before summarising the
+/// rest. Small enough that the box still fits an 80x24 terminal.
+pub const CANDIDATE_ROWS: usize = 8;
+
+/// The bottom line of a prompt, naming only the keys this prompt has.
+pub fn keybinding_line(opts: &PromptOpts<'_>, all: bool) -> String {
+    let mut parts = vec!["  Enter accepts".to_string(), "Esc cancels".to_string()];
+    if opts.complete.is_some() {
+        parts.push("Tab completes".into());
+    }
+    if let Some(label) = opts.toggle {
+        parts.push(format!(
+            "Ctrl-A {} {label}",
+            if all { "hides" } else { "shows" }
+        ));
+    }
+    parts.join(", ")
 }
 
 /// Anything is accepted.
@@ -378,5 +539,79 @@ mod tests {
             height <= 24,
             "{height} rows is too tall for an 80x24 screen"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Completion and the live note
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn candidates_are_listed_up_to_a_limit_and_then_counted() {
+        assert!(candidate_lines(&[], 40).is_empty());
+        let few: Vec<String> = (0..3).map(|i| format!("/bin/x{i}")).collect();
+        let lines = candidate_lines(&few, 40);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("/bin/x0"));
+
+        let many: Vec<String> = (0..30).map(|i| format!("/bin/x{i}")).collect();
+        let lines = candidate_lines(&many, 40);
+        assert_eq!(lines.len(), CANDIDATE_ROWS + 1);
+        assert!(lines.last().unwrap().contains("22 more"), "{lines:?}");
+    }
+
+    /// A long candidate is clipped rather than allowed to widen the box.
+    #[test]
+    fn candidates_are_clipped_to_the_box() {
+        let long = vec!["/".to_string() + &"a".repeat(200)];
+        for width in [8usize, 20, 40, 74] {
+            for l in candidate_lines(&long, width) {
+                assert!(l.chars().count() <= width.max(8), "{width}: {l}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_prompt_only_advertises_the_keys_it_has() {
+        let plain = PromptOpts::default();
+        let line = keybinding_line(&plain, false);
+        assert!(line.contains("Enter accepts") && line.contains("Esc cancels"));
+        assert!(!line.contains("Tab"), "{line}");
+        assert!(!line.contains("Ctrl-A"), "{line}");
+
+        let f = |_: &str, _: bool| Completion::default();
+        let full = PromptOpts {
+            complete: Some(&f),
+            toggle: Some("system accounts"),
+            ..Default::default()
+        };
+        let line = keybinding_line(&full, false);
+        assert!(line.contains("Tab completes"), "{line}");
+        assert!(line.contains("Ctrl-A shows system accounts"), "{line}");
+        assert!(
+            keybinding_line(&full, true).contains("Ctrl-A hides"),
+            "{line}"
+        );
+    }
+
+    /// An absent note or candidate list costs no vertical space at all.
+    #[test]
+    fn empty_blocks_take_no_rows() {
+        assert_eq!(block_of(&[]), "");
+        assert_eq!(block_of(&["a".to_string()]), "\na\n");
+    }
+
+    /// The box has to grow for the candidate list too, or completing a
+    /// directory pushes the keybindings out of sight -- the same failure the
+    /// option help caused.
+    #[test]
+    fn a_prompt_box_grows_to_fit_its_candidates() {
+        let many: Vec<String> = (0..30).map(|i| format!("/usr/bin/thing{i}")).collect();
+        let body = format!(
+            "help line\n\n  /usr/bin/th_\n{}\n\n  Enter accepts, Esc cancels",
+            block_of(&candidate_lines(&many, 70))
+        );
+        let height = wrapped_height(&body, 70) + 2;
+        assert!(height >= body.lines().count() + 2, "{height}");
+        assert!(height <= 24, "{height} rows will not fit an 80x24 screen");
     }
 }
