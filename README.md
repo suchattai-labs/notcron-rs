@@ -16,6 +16,11 @@ notcron add "0 3 * * *" /usr/bin/backup    # headless, from a cron expression
 notcron remove backup                      # stop, disable, delete, reload
 ```
 
+`--user` and `--system` are global: they may be given before or after the
+subcommand, so `notcron --system list` and `notcron list --system` are the
+same command. On the bare `notcron` they choose the scope the builder opens
+in.
+
 ## Why
 
 Cron jobs are easy to write and miserable to operate: no logs, no status, no
